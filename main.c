@@ -12,8 +12,10 @@
 #include <time.h>
 
 #ifdef __APPLE__
-#include <OpenAL/al.h>
-#include <OpenAL/alure.h>
+// Use openal-soft instead of deprecated system OpenAL
+#include <AL/al.h>
+#include <AL/alc.h>
+#include <AL/alure.h>
 #else
 #include <AL/al.h>
 #include <AL/alc.h>
