@@ -57,7 +57,7 @@ $(BIN):	$(OBJS)
 
 dist:
 	mkdir -p $(NAME)-$(VERSION)
-	cp -a *.c *.h wav Makefile LICENSE $(NAME)-$(VERSION)
+	cp -a *.c *.h wav scripts Makefile LICENSE $(NAME)-$(VERSION)
 	tar -zcf /tmp/$(NAME)-$(VERSION).tgz $(NAME)-$(VERSION)
 	rm -rf $(NAME)-$(VERSION)
 
@@ -69,3 +69,11 @@ clean:
 
 strip: $(BIN)
 	$(STRIP) $(BIN)
+
+# Convert a Klack.app sound pack into wav-klack/<PACK>/ using the same
+# filename convention as wav/. Requires macOS (afconvert) and a local
+# Klack install; see scripts/convert-klack-sounds.py for details.
+KLACK_PACK ?= Cardboard
+.PHONY: wav-klack
+wav-klack:
+	./scripts/convert-klack-sounds.py --pack "$(KLACK_PACK)"
