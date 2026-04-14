@@ -27,8 +27,8 @@ else
   PKG_CONFIG_PATH := "./mac/lib/pkgconfig" 
   LIBS    += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs alure openal)
   CFLAGS  += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags alure openal)
-  LDFLAGS += -framework ApplicationServices -Wl,-rpath,@executable_path/mac/lib -Wl,-rpath,/opt/homebrew/opt/openal-soft/lib
-  SRC     += scan-mac.c
+  LDFLAGS += -framework ApplicationServices -framework Cocoa -Wl,-rpath,@executable_path/mac/lib -Wl,-rpath,/opt/homebrew/opt/openal-soft/lib
+  SRC     += scan-mac.m
  else
   BIN     := $(NAME)
   ifdef libinput
@@ -43,7 +43,7 @@ else
  endif
 endif
 
-OBJS    = $(subst .c,.o, $(SRC))
+OBJS    = $(addsuffix .o, $(basename $(SRC)))
 CC 	?= $(CROSS)gcc
 LD 	?= $(CROSS)gcc
 CCLD 	?= $(CC)
@@ -52,12 +52,15 @@ STRIP 	= $(CROSS)strip
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+%.o: %.m
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
 $(BIN):	$(OBJS)
 	$(CCLD) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
 
 dist:
 	mkdir -p $(NAME)-$(VERSION)
-	cp -a *.c *.h wav scripts Makefile LICENSE $(NAME)-$(VERSION)
+	cp -a *.c *.m *.h wav scripts Makefile LICENSE $(NAME)-$(VERSION)
 	tar -zcf /tmp/$(NAME)-$(VERSION).tgz $(NAME)-$(VERSION)
 	rm -rf $(NAME)-$(VERSION)
 

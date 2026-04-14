@@ -323,6 +323,7 @@ static int wav_code_of(int code)
 		case 0x61: return 0x1d;  /* RCtrl → LCtrl wav */
 		case 0x64: return 0x38;  /* RAlt  → LAlt  wav */
 		case 0x7e: return 0x5b;  /* RMeta → LMeta wav */
+		case 0xfe: return 0x1c;  /* synthetic scancode for macOS NX_SYSDEFINED (consumer/media keys, Karabiner consumer_key_code) → Enter click */
 		default:   return code;
 	}
 }
