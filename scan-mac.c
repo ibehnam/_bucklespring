@@ -62,7 +62,7 @@ static const int mactoset1[] =
 	0x0e,            /* QZ_BACKSPACE    0x33 */
 	0x9c,            /* QZ_IBOOK_ENTER  0x34 */
 	0x01,            /* QZ_ESCAPE       0x35 */
-	0x5c,            /* QZ_RMETA        0x36 */
+	0x5b,            /* QZ_RMETA        0x36 (→ LMeta, no 5c wav) */
 	0x5b,            /* QZ_LMETA        0x37 */
 	0x2a,            /* QZ_LSHIFT       0x38 */
 	0x3a,            /* QZ_CAPSLOCK     0x39 */
@@ -146,9 +146,17 @@ static const int mactoset1[] =
  * Adapted from https://danielbeard.wordpress.com/2010/10/29/listening-for-global-keypresses-in-osx/ 
  */
 
+/*
+ * Modifier keys (shift/ctrl/alt/cmd/capslock) emit kCGEventFlagsChanged, which
+ * carries no press/release bit. The global flag mask (kCGEventFlagMaskShift etc.)
+ * is unreliable when both L+R of a modifier are held, so we track press state
+ * per Mac keycode and toggle on each flagsChanged event.
+ */
+static int keystate[128];
+
 CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
-	if ((type != kCGEventKeyDown) && (type != kCGEventKeyUp))
+	if (type != kCGEventKeyDown && type != kCGEventKeyUp && type != kCGEventFlagsChanged)
 		return event;
 
 	int mackeycode = (int)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
@@ -159,16 +167,21 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 
 	int key = mactoset1[mackeycode];
 
-	if (CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat))
-		return event;
-
 	switch (type) {
 		case kCGEventKeyDown:
+			if (CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat))
+				return event;
 			play(key, 1);
 			break;
 		case kCGEventKeyUp:
 			play(key, 0);
 			break;
+		case kCGEventFlagsChanged: {
+			int press = !keystate[mackeycode];
+			keystate[mackeycode] = press;
+			play(key, press);
+			break;
+		}
 		default:
 			break;
 	}
@@ -185,7 +198,7 @@ int scan(int verbose)
 
 	/* Create an event tap. We are interested in key presses. */
 
-	eventMask = ((1 << kCGEventKeyDown) | (1 << kCGEventKeyUp));
+	eventMask = ((1 << kCGEventKeyDown) | (1 << kCGEventKeyUp) | (1 << kCGEventFlagsChanged));
 	eventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, 0, eventMask, myCGEventCallback, NULL);
 	if (!eventTap) {
 		fprintf(stderr, "failed to create event tap\n");
