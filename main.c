@@ -313,6 +313,27 @@ static void handle_mute_key(int mute_key)
 
 
 /*
+ * Right-side modifier keys (RCtrl, RAlt, RMeta) share a keyswitch type with
+ * their left counterparts — same recorded sound, different stereo position.
+ * Route wav lookup to the L-counterpart's file so third-party sound packs
+ * that only provide L-variants (e.g. klack-converted packs, or bucklespring's
+ * own baseline where 7e-*.wav was never recorded) work out of the box.
+ * Position lookup via find_key_loc(code) still uses the full code, so L/R
+ * pan to their own speakers. Shift stays distinct (LShift=0x2a, RShift=0x36
+ * have distinct recordings on the Model-M).
+ */
+static int wav_code_of(int code)
+{
+	switch (code) {
+		case 0x61: return 0x1d;  /* RCtrl → LCtrl wav */
+		case 0x64: return 0x38;  /* RAlt  → LAlt  wav */
+		case 0x7e: return 0x5b;  /* RMeta → LMeta wav */
+		default:   return code;
+	}
+}
+
+
+/*
  * Play audio file for given keycode. Wav files are loaded on demand
  */
 
@@ -338,7 +359,7 @@ int play(int code, int press)
 	if(src[idx] == 0) {
 
 		char fname[256];
-		snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, code, press);
+		snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, wav_code_of(code), press);
 
 		printd("Loading audio file \"%s\"", fname);
 
