@@ -154,6 +154,29 @@ options:
   -v        increase verbosity / debugging
 ````
 
+Sound packs
+-----------
+
+Because the WAV directory is selectable at runtime via `-p PATH`, bucklespring
+can play any sound pack that follows its `{hex_scancode}-{0|1}.wav` naming
+scheme. A helper script converts sound packs from [Klack](https://klack.app)
+(a separate paid macOS app) into this format so you can use them with buckle:
+
+```
+$ ./scripts/convert-klack-sounds.py --pack Cardboard
+$ ./buckle -p ./wav-klack/Cardboard
+```
+
+Klack ships six packs (`Cardboard`, `Cream`, `Crystal Purple`, `Japanese Black`,
+`Milky Yellow`, `Oreo`). Klack only covers letters, modifiers, and arrow keys,
+so the script overlays its samples on top of the Model-M baseline in `wav/` —
+F-keys, keypad, and mouse click keep the authentic Model-M sound, so every key
+makes noise out of the box. Convert all six at once with `--all`.
+
+Klack is proprietary; the script operates only on your local installation and
+does not redistribute any audio. The generated directory is ignored by git.
+On macOS the script uses the built-in `afconvert` (no extra dependencies).
+
 OpenAL notes
 ------------
 
