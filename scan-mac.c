@@ -62,15 +62,15 @@ static const int mactoset1[] =
 	0x0e,            /* QZ_BACKSPACE    0x33 */
 	0x9c,            /* QZ_IBOOK_ENTER  0x34 */
 	0x01,            /* QZ_ESCAPE       0x35 */
-	0x5b,            /* QZ_RMETA        0x36 (→ LMeta, no 5c wav) */
+	0x7e,            /* QZ_RMETA        0x36 (evdev RMETA; positions at R of space) */
 	0x5b,            /* QZ_LMETA        0x37 */
 	0x2a,            /* QZ_LSHIFT       0x38 */
 	0x3a,            /* QZ_CAPSLOCK     0x39 */
 	0x38,            /* QZ_LALT         0x3A */
 	0x1d,            /* QZ_LCTRL        0x3B */
 	0x36,            /* QZ_RSHIFT       0x3C */
-	0x38,            /* QZ_RALT         0x3D */
-	0x1d,            /* QZ_RCTRL        0x3E */
+	0x64,            /* QZ_RALT         0x3D (evdev RALT) */
+	0x61,            /* QZ_RCTRL        0x3E (evdev RCTRL) */
 	0,               /*                      */
 	0,               /*                      */
 	0x53,            /* QZ_KP_PERIOD    0x41 */
