@@ -11,16 +11,9 @@
 #include <getopt.h>
 #include <time.h>
 
-#ifdef __APPLE__
-// Use openal-soft instead of deprecated system OpenAL
 #include <AL/al.h>
 #include <AL/alc.h>
 #include <AL/alure.h>
-#else
-#include <AL/al.h>
-#include <AL/alc.h>
-#include <AL/alure.h>
-#endif
 
 #include "buckle.h"
 
