@@ -16,3 +16,4 @@ mac/lib/pkgconfig/openal.pc
 wav-klack/
 /exir
 /CLAUDE.md
+/.claude/settings.local.json
