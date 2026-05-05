@@ -157,7 +157,7 @@ int main(int argc, char **argv)
 	ALCenum error;
 
 	if (!opt_device) {
-		opt_device = alcGetString(NULL, ALC_DEFAULT_DEVICE_SPECIFIER);
+		opt_device = alcGetString(NULL, ALC_DEFAULT_ALL_DEVICES_SPECIFIER);
 	}
 
 	printd("Opening OpenAL audio device \"%s\"", opt_device);
@@ -227,7 +227,7 @@ static void usage(char *exe)
 
 static void list_devices(void)
 {
-	const ALCchar *devices = alcGetString(NULL, ALC_DEVICE_SPECIFIER);
+	const ALCchar *devices = alcGetString(NULL, ALC_ALL_DEVICES_SPECIFIER);
 	const ALCchar *device = devices, *next = devices + 1;
 	size_t len = 0;
 
