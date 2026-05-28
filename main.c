@@ -156,6 +156,8 @@ int main(int argc, char **argv)
 	ALfloat listenerOri[] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f };
 	ALCenum error;
 
+	int follow_default = (opt_device == NULL);
+
 	if (!opt_device) {
 		opt_device = alcGetString(NULL, ALC_DEFAULT_ALL_DEVICES_SPECIFIER);
 	}
@@ -190,7 +192,7 @@ int main(int argc, char **argv)
 
 	printd("Using wav dir: \"%s\"\n", opt_path_audio);
 
-	scan(opt_verbose);
+	scan(opt_verbose, follow_default);
 
 out:
 	device = alcGetContextsDevice(context);

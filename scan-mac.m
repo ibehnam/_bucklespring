@@ -1,6 +1,10 @@
 #include <ApplicationServices/ApplicationServices.h>
 #import <Cocoa/Cocoa.h>
 #include <IOKit/hidsystem/ev_keymap.h>   /* NX_SYSDEFINED, NX_SUBTYPE_AUX_CONTROL_BUTTONS, NX_KEYTYPE_* */
+#include <CoreAudio/CoreAudio.h>
+#include <AL/alc.h>
+#include <AL/alext.h>
+#include <dispatch/dispatch.h>
 #include "buckle.h"
 
 #define SCANCODE_SYSDEFINED 0xfe
@@ -221,8 +225,40 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 }
 
 
-int scan(int verbose)
+static LPALCREOPENDEVICESOFT g_reopen = NULL;
+
+static void register_default_output_listener(void)
 {
+	g_reopen = (LPALCREOPENDEVICESOFT)alcGetProcAddress(NULL, "alcReopenDeviceSOFT");
+	if (!g_reopen) {
+		printd("ALC_SOFT_reopen_device unavailable; output device will not auto-follow");
+		return;
+	}
+
+	AudioObjectPropertyAddress addr = {
+		kAudioHardwarePropertyDefaultOutputDevice,
+		kAudioObjectPropertyScopeGlobal,
+		kAudioObjectPropertyElementMain
+	};
+
+	AudioObjectAddPropertyListenerBlock(
+	    kAudioObjectSystemObject, &addr, dispatch_get_main_queue(),
+	    ^(UInt32 n, const AudioObjectPropertyAddress *p) {
+	        ALCcontext *ctx = alcGetCurrentContext();
+	        ALCdevice *dev = ctx ? alcGetContextsDevice(ctx) : NULL;
+	        if (g_reopen && dev) {
+	            if (g_reopen(dev, NULL, NULL) == ALC_TRUE)
+	                printd("Reopened OpenAL on new default output");
+	            else
+	                printd("alcReopenDeviceSOFT failed");
+	        }
+	    });
+}
+
+int scan(int verbose, int follow_default)
+{
+	if (follow_default) register_default_output_listener();
+
 	CFMachPortRef      eventTap;
 	CGEventMask        eventMask;
 	CFRunLoopSourceRef runLoopSource;

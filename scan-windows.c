@@ -14,8 +14,9 @@ static HHOOK kbh = NULL;
 static int state[256] = { 0 };
 
 
-int scan(int verbose)
+int scan(int verbose, int follow_default)
 {
+	(void)follow_default;
 	HINSTANCE hInst = GetModuleHandle(NULL);
 
 	kbh = SetWindowsHookEx(WH_KEYBOARD_LL, handle_kbh, hInst, 0);
