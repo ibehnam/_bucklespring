@@ -2,7 +2,7 @@
 #define buckle_h
 
 int play(int code, int press);
-int scan(int verbose, int follow_default);
+int scan(int verbose);
 void printd(const char *fmt, ...);
 void open_console(void);
 

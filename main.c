@@ -10,9 +10,11 @@
 #include <stdbool.h>
 #include <getopt.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #include <AL/al.h>
 #include <AL/alc.h>
+#include <AL/alext.h>
 #include <AL/alure.h>
 
 #include "buckle.h"
@@ -92,13 +94,127 @@ static const struct option long_opts[] = {
 
 
 
+/*
+ * Audio device + context. openal-soft's CoreAudio backend never migrates to a
+ * new default output on its own — it only notifies — so the app must re-point.
+ * Its cached device enumeration (alcGetString) is NOT refreshed mid-process, but
+ * alcReopenDeviceSOFT(dev, NULL, ...) re-resolves the *live* default via the
+ * backend (verified), so on the library's own DefaultDeviceChanged event we flag,
+ * and the next play() reopens the existing device+context onto the new default.
+ * The process stays put — Stop still works, and sources/buffers survive the reopen.
+ */
+static ALCdevice  *device  = NULL;
+static ALCcontext *context = NULL;
+static LPALCREOPENDEVICESOFT g_reopen = NULL;   /* live default re-resolver */
+static atomic_int g_reacquire = 0;              /* set by the ALC event callback */
+
+/* Lazily-loaded per-key buffers/sources, keyed by code + press*256. */
+static ALuint snd_buf[512] = { 0 };
+static ALuint snd_src[512] = { 0 };
+
+/* Open the output device + context and make it current. On a fresh process the
+ * default specifier resolves to the current system default output. */
+static int open_audio(void)
+{
+	static const ALfloat listenerOri[] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f };
+	const ALCchar *name = opt_device;
+
+	if (!name) {
+		name = alcGetString(NULL, ALC_DEFAULT_ALL_DEVICES_SPECIFIER);
+	}
+	fprintf(stderr, "buckle: opening OpenAL output device \"%s\"\n", name ? name : "(default)");
+
+	device = alcOpenDevice(name);
+	if (!device) {
+		fprintf(stderr, "buckle: unable to open audio device\n");
+		return -1;
+	}
+
+	context = alcCreateContext(device, NULL);
+	if (!context || !alcMakeContextCurrent(context)) {
+		fprintf(stderr, "buckle: failed to make audio context current\n");
+		if (context) { alcDestroyContext(context); context = NULL; }
+		alcCloseDevice(device);
+		device = NULL;
+		return -1;
+	}
+
+	(void)alGetError();
+	alListener3f(AL_POSITION, 0, 0, 0);
+	alListener3f(AL_VELOCITY, 0, 0, 0);
+	alListenerfv(AL_ORIENTATION, listenerOri);
+	return 0;
+}
+
+static void close_audio(void)
+{
+	alcMakeContextCurrent(NULL);
+	if (context) { alcDestroyContext(context); context = NULL; }
+	if (device)  { alcCloseDevice(device);     device  = NULL; }
+}
+
+/* Re-point the open device+context onto the current system default. Safe to call
+ * from the main thread (play()); alcReopenDeviceSOFT preserves sources/buffers. */
+static void reacquire_default(void)
+{
+	if (!g_reopen || !device) return;
+	if (g_reopen(device, NULL, NULL) == ALC_TRUE) {
+		const ALCchar *now = alcGetString(device, ALC_ALL_DEVICES_SPECIFIER);
+		fprintf(stderr, "buckle: followed default to \"%s\"\n", now ? now : "(default)");
+	} else {
+		fprintf(stderr, "buckle: alcReopenDeviceSOFT failed; will retry\n");
+		atomic_store(&g_reacquire, 1);   /* retry on the next keystroke */
+	}
+}
+
+/*
+ * openal-soft system-events callback. Runs asynchronously on a background
+ * thread, where the spec forbids AL/ALC calls — so it only sets a flag; the
+ * next play() performs the reopen on the main thread.
+ */
+static void ALC_APIENTRY on_alc_event(ALCenum eventType, ALCenum deviceType,
+				      ALCdevice *dev, ALCsizei length,
+				      const ALCchar *message, void *user)
+{
+	(void)dev; (void)length; (void)message; (void)user;
+	if (eventType == ALC_EVENT_TYPE_DEFAULT_DEVICE_CHANGED_SOFT &&
+	    deviceType == ALC_PLAYBACK_DEVICE_SOFT) {
+		fprintf(stderr, "buckle: default output device changed\n");
+		atomic_store(&g_reacquire, 1);
+	}
+}
+
+/* Subscribe to default-output-device changes via ALC_SOFT_system_events. This
+ * reuses the listener openal-soft already runs internally — no second listener. */
+static void subscribe_default_device_events(void)
+{
+	if (!alcIsExtensionPresent(NULL, "ALC_SOFT_system_events")) {
+		fprintf(stderr, "buckle: ALC_SOFT_system_events unavailable; not following default device\n");
+		return;
+	}
+
+	g_reopen = (LPALCREOPENDEVICESOFT) alcGetProcAddress(NULL, "alcReopenDeviceSOFT");
+	LPALCEVENTCONTROLSOFT  event_control  = (LPALCEVENTCONTROLSOFT)  alcGetProcAddress(NULL, "alcEventControlSOFT");
+	LPALCEVENTCALLBACKSOFT event_callback = (LPALCEVENTCALLBACKSOFT) alcGetProcAddress(NULL, "alcEventCallbackSOFT");
+	if (!g_reopen || !event_control || !event_callback) {
+		fprintf(stderr, "buckle: reopen/system-events functions unavailable; not following default device\n");
+		return;
+	}
+
+	const ALCenum events[] = { ALC_EVENT_TYPE_DEFAULT_DEVICE_CHANGED_SOFT };
+	event_callback(on_alc_event, NULL);
+	event_control(1, events, ALC_TRUE);
+	fprintf(stderr, "buckle: following system default output device\n");
+}
+
+
 int main(int argc, char **argv)
 {
 	int c;
 	int rv = EXIT_SUCCESS;
 	int idx;
 
-	while( (c = getopt_long(argc, argv, 
+	while( (c = getopt_long(argc, argv,
 			       short_opts, long_opts, &idx)) != -1) {
 		switch(c) {
 			case 'd':
@@ -149,39 +265,6 @@ int main(int argc, char **argv)
 		open_console();
 	}
 
-	/* Create openal context */
-
-	ALCdevice *device = NULL;
-	ALCcontext *context = NULL;
-	ALfloat listenerOri[] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f };
-	ALCenum error;
-
-	int follow_default = (opt_device == NULL);
-
-	if (!opt_device) {
-		opt_device = alcGetString(NULL, ALC_DEFAULT_ALL_DEVICES_SPECIFIER);
-	}
-
-	printd("Opening OpenAL audio device \"%s\"", opt_device);
-
-	device = alcOpenDevice(opt_device);
-	if (!device) {
-		fprintf(stderr, "unable to open default device\n");
-		rv = EXIT_FAILURE;
-		goto out;
-	}
-
-	context = alcCreateContext(device, NULL);
-	if (!alcMakeContextCurrent(context)) {
-		fprintf(stderr, "failed to make default context\n");
-		return -1;
-	}
-	TEST_ERROR("make default context");
-
-	alListener3f(AL_POSITION, 0, 0, 0);
-	alListener3f(AL_VELOCITY, 0, 0, 0);
-	alListenerfv(AL_ORIENTATION, listenerOri);
-
 	/* Path to data files can also be specified by environment, this is
 	 * used by the snap package */
 
@@ -190,15 +273,25 @@ int main(int argc, char **argv)
 		opt_path_audio = env_path;
 	}
 
+	/* Open the output device. When no device was pinned with -d, also follow the
+	 * system default: subscribe to openal-soft's DefaultDeviceChanged event and
+	 * re-exec on change so a fresh process opens the new default. */
+
+	if (open_audio() != 0) {
+		rv = EXIT_FAILURE;
+		goto out;
+	}
+
+	if (opt_device == NULL) {
+		subscribe_default_device_events();
+	}
+
 	printd("Using wav dir: \"%s\"\n", opt_path_audio);
 
-	scan(opt_verbose, follow_default);
+	scan(opt_verbose);
 
 out:
-	device = alcGetContextsDevice(context);
-	alcMakeContextCurrent(NULL);
-	if(context) alcDestroyContext(context);
-	if(device) alcCloseDevice(device);
+	close_audio();
 
 	return rv;
 }
@@ -350,58 +443,70 @@ int play(int code, int press)
 
 	if (code == 0xff && opt_no_click) return 0;
 
+	/* Follow a default-output-device change (flagged by the ALC event callback)
+	 * before this click sounds: alcReopenDeviceSOFT re-points to the live default. */
+	if (atomic_exchange(&g_reacquire, 0)) {
+		reacquire_default();
+	}
+
 	/* Check for mute sequence: ScrollLock down+up+down */
 
 	if (press) {
 		handle_mute_key(code == opt_mute_keycode);
 	}
 
-	static ALuint buf[512] = { 0 };
-	static ALuint src[512] = { 0 };
-
 	int idx = code + press * 256;
 
-	if(src[idx] == 0) {
+	if(snd_src[idx] == 0) {
 
 		char fname[256];
 		snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, wav_code_of(code), press);
 
 		printd("Loading audio file \"%s\"", fname);
 
-		buf[idx] = alureCreateBufferFromFile(fname);
-		if(buf[idx] == 0) {
+		snd_buf[idx] = alureCreateBufferFromFile(fname);
+		if(snd_buf[idx] == 0) {
 
 			if(opt_fallback_sound) {
 				snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, 0x31, press);
-				buf[idx] = alureCreateBufferFromFile(fname);
+				snd_buf[idx] = alureCreateBufferFromFile(fname);
 			} else {
 				fprintf(stderr, "Error opening audio file \"%s\": %s\n", fname, alureGetErrorString());
 			}
 
-			if(buf[idx] == 0) {
-				src[idx] = SRC_INVALID;
+			if(snd_buf[idx] == 0) {
+				snd_src[idx] = SRC_INVALID;
 				return -1;
 			}
 		}
 	
-		alGenSources((ALuint)1, &src[idx]);
-		TEST_ERROR("source generation");
+		alGenSources((ALuint)1, &snd_src[idx]);
+		error = alGetError();
+		if (error != AL_NO_ERROR) {
+			fprintf(stderr, "buckle: source generation error 0x%x; dropping click\n", error);
+			snd_src[idx] = 0;
+			return -1;
+		}
 
 		double x = find_key_loc(code);
 		if (opt_stereo_width > 0) {
-			alSource3f(src[idx], AL_POSITION, -x, 0, (100 - opt_stereo_width) / 100.0);
+			alSource3f(snd_src[idx], AL_POSITION, -x, 0, (100 - opt_stereo_width) / 100.0);
 		}
-		alSourcef(src[idx], AL_GAIN, opt_gain / 100.0);
+		alSourcef(snd_src[idx], AL_GAIN, opt_gain / 100.0);
 
-		alSourcei(src[idx], AL_BUFFER, buf[idx]);
-		TEST_ERROR("buffer binding");
+		alSourcei(snd_src[idx], AL_BUFFER, snd_buf[idx]);
+		(void)alGetError();   /* non-fatal: a transient bind error won't kill the daemon */
 	}
 
 
-	if(src[idx] != 0 && src[idx] != SRC_INVALID) {
+	if(snd_src[idx] != 0 && snd_src[idx] != SRC_INVALID) {
 		if (!muted)
-			alSourcePlay(src[idx]);
-		TEST_ERROR("source playing");
+			alSourcePlay(snd_src[idx]);
+		error = alGetError();
+		if (error != AL_NO_ERROR) {
+			/* Non-fatal: don't let a transient AL error kill the daemon. */
+			fprintf(stderr, "buckle: playback error 0x%x; dropping click\n", error);
+		}
 	}
 
 	return 0;

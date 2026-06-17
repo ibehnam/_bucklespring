@@ -72,9 +72,8 @@ static void log_handler(struct libinput *li, enum libinput_log_priority priority
 }
 
 
-int scan(int verbose, int follow_default)
+int scan(int verbose)
 {
-	(void)follow_default;
 	struct udev *udev;
 	struct libinput *li;
 
