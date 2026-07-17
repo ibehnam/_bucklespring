@@ -157,9 +157,34 @@ static const int mactoset1[] =
  * per Mac keycode and toggle on each flagsChanged event.
  */
 static int keystate[128];
+static CFMachPortRef g_tap;
+
+static void tap_ensure_enabled(const char *why)
+{
+	if (g_tap && !CGEventTapIsEnabled(g_tap)) {
+		CGEventTapEnable(g_tap, true);
+		fprintf(stderr, "buckle: event tap re-enabled (%s)\n", why);
+	}
+}
+
+static void tap_watchdog(CFRunLoopTimerRef timer, void *info)
+{
+	(void)timer;
+	(void)info;
+	tap_ensure_enabled("watchdog");
+}
 
 CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
+	if (type == kCGEventTapDisabledByTimeout) {
+		tap_ensure_enabled("timeout");
+		return event;
+	}
+	if (type == kCGEventTapDisabledByUserInput) {
+		tap_ensure_enabled("user input");
+		return event;
+	}
+
 	if (type != kCGEventKeyDown && type != kCGEventKeyUp
 	    && type != kCGEventFlagsChanged && (int)type != NX_SYSDEFINED)
 		return event;
@@ -224,9 +249,9 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 
 int scan(int verbose)
 {
-	CFMachPortRef      eventTap;
 	CGEventMask        eventMask;
 	CFRunLoopSourceRef runLoopSource;
+	CFRunLoopTimerRef  watchdogTimer;
 
 	/* Create an event tap. We are interested in key presses. */
 
@@ -234,20 +259,27 @@ int scan(int verbose)
 	           | (1 << kCGEventKeyUp)
 	           | (1 << kCGEventFlagsChanged)
 	           | (1 << NX_SYSDEFINED));
-	eventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, 0, eventMask, myCGEventCallback, NULL);
-	if (!eventTap) {
+	g_tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+	                         kCGEventTapOptionListenOnly, eventMask,
+	                         myCGEventCallback, NULL);
+	if (!g_tap) {
 		fprintf(stderr, "failed to create event tap\n");
 		exit(1);
 	}
 
 	/* Create a run loop source. */
-	runLoopSource = CFMachPortCreateRunLoopSource( kCFAllocatorDefault, eventTap, 0);
+	runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, g_tap, 0);
+	watchdogTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+	                                     CFAbsoluteTimeGetCurrent() + 5.0, 5.0,
+	                                     0, 0, tap_watchdog, NULL);
 
 	/* Add to the current run loop. */
 	CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
+	if (watchdogTimer)
+		CFRunLoopAddTimer(CFRunLoopGetCurrent(), watchdogTimer, kCFRunLoopCommonModes);
 
 	/* Enable the event tap. */
-	CGEventTapEnable(eventTap, true);
+	CGEventTapEnable(g_tap, true);
 
 	/* Set it all running. */
 	CFRunLoopRun();
