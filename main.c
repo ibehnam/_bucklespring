@@ -74,6 +74,26 @@ static const char *opt_device = NULL;
 static const char *opt_path_audio = PATH_AUDIO;
 static int muted = 0;
 
+/*
+ * Quiet hours: a gain window evaluated at PLAY time rather than at configure time,
+ * so a running buckle dims and un-dims on the clock with no timer, no daemon, and no
+ * relaunch at the boundary. Bounds are MINUTES since midnight — the same unit and the
+ * same three-branch rule as the shell's tmux_quiet_active (AI/tmux-ui-lib.sh in the
+ * tmux config that launches this), which --gain-at exists to prove agreement with.
+ * from == to is the OFF encoding and the DEFAULT, so a buckle launched without these
+ * flags behaves byte-identically to before they existed.
+ */
+static int opt_quiet_from = 0;
+static int opt_quiet_to = 0;
+static int opt_quiet_gain = 0;
+
+/* Long-only options: values above the char range so they can't collide with short_opts. */
+enum {
+	OPT_QUIET_FROM = 256,
+	OPT_QUIET_TO,
+	OPT_QUIET_GAIN,
+	OPT_GAIN_AT,
+};
 
 static const char short_opts[] = "d:fg:hlm:Mp:s:cv";
 
@@ -89,8 +109,60 @@ static const struct option long_opts[] = {
 	{ "stereo-width",   required_argument, NULL, 's' },
 	{ "no-click",       no_argument,       NULL, 'c' },
 	{ "verbose",        no_argument,       NULL, 'v' },
+	{ "quiet-from",     required_argument, NULL, OPT_QUIET_FROM },
+	{ "quiet-to",       required_argument, NULL, OPT_QUIET_TO },
+	{ "quiet-gain",     required_argument, NULL, OPT_QUIET_GAIN },
+	{ "gain-at",        required_argument, NULL, OPT_GAIN_AT },
         { 0, 0, 0, 0 }
 };
+
+/*
+ * Is NOW (minutes since midnight) inside the quiet window? from == to ⇒ off;
+ * from < to ⇒ a same-day window; from > to ⇒ one that wraps midnight. Start
+ * inclusive, end exclusive. This is the design's ONLY rule duplicated between C and
+ * the shell, which is why --gain-at exposes it to the shell test suite.
+ */
+static int in_quiet(int now)
+{
+	if (opt_quiet_from == opt_quiet_to) return 0;
+	if (opt_quiet_from < opt_quiet_to)  return now >= opt_quiet_from && now < opt_quiet_to;
+	return now >= opt_quiet_from || now < opt_quiet_to;
+}
+
+/* The gain a click at minute-of-day NOW must play at. --gain-at's seam. */
+static int gain_at(int now)
+{
+	return in_quiet(now) ? opt_quiet_gain : opt_gain;
+}
+
+/*
+ * The gain THIS click must play at. play() runs inside the macOS CGEventTap callback,
+ * where a slow callback is exactly what gets the tap disabled by the system, so the
+ * clock work is guarded twice:
+ *   • quiet disabled (the default, and the state buckle ships in) ⇒ return immediately;
+ *     one integer compare, no clock read at all;
+ *   • enabled ⇒ time() only — a commpage read, not a syscall — with localtime_r run at
+ *     most once per wall-clock minute, so typing speed is irrelevant.
+ * localtime_r, not localtime: an ALC event-callback thread runs alongside this one, and
+ * localtime() hands back a shared static struct tm.
+ */
+static int effective_gain(void)
+{
+	static time_t cached_minute = -1;
+	static int cached_now = 0;
+	time_t now;
+	struct tm tm;
+
+	if (opt_quiet_from == opt_quiet_to) return opt_gain;
+
+	now = time(NULL);
+	if (now / 60 != cached_minute) {
+		localtime_r(&now, &tm);
+		cached_minute = now / 60;
+		cached_now = tm.tm_hour * 60 + tm.tm_min;
+	}
+	return gain_at(cached_now);
+}
 
 
 
@@ -111,6 +183,11 @@ static atomic_int g_reacquire = 0;              /* set by the ALC event callback
 /* Lazily-loaded per-key buffers/sources, keyed by code + press*256. */
 static ALuint snd_buf[512] = { 0 };
 static ALuint snd_src[512] = { 0 };
+/* What gain each live source currently carries, so the per-play path issues alSourcef
+ * only on an actual CHANGE (steady state: one integer compare, zero OpenAL calls). Seeded
+ * to -1 where the source is created — plain static zero-init would be wrong, 0 is a valid
+ * gain — which forces the first apply without a separate init loop. */
+static int applied_gain[512];
 
 /* Open the output device + context and make it current. On a fresh process the
  * default specifier resolves to the current system default output. */
@@ -254,6 +331,21 @@ int main(int argc, char **argv)
 			case 'v':
 				opt_verbose++;
 				break;
+			case OPT_QUIET_FROM:
+				opt_quiet_from = atoi(optarg);
+				break;
+			case OPT_QUIET_TO:
+				opt_quiet_to = atoi(optarg);
+				break;
+			case OPT_QUIET_GAIN:
+				opt_quiet_gain = atoi(optarg);
+				break;
+			case OPT_GAIN_AT:
+				/* Print the rule's answer for one minute-of-day and exit — the seam
+				 * the shell suite drives to prove in_quiet() and tmux_quiet_active
+				 * agree. Reads the gain options parsed BEFORE it on the argv. */
+				printf("%d\n", gain_at(atoi(optarg)));
+				return 0;
 			default:
 				usage(argv[0]);
 				return 1;
@@ -315,7 +407,12 @@ static void usage(char *exe)
 		"  -l, --list-devices        list available OpenAL audio devices\n"
 		"  -p, --audio-path=PATH     load .wav files from directory PATH\n"
 		"  -s, --stereo-width=WIDTH  set stereo width [0..100]\n"
-		"  -v, --verbose             increase verbosity / debugging\n",
+		"  -v, --verbose             increase verbosity / debugging\n"
+		"      --quiet-from=MIN      start of the quiet-hours window, minutes since midnight\n"
+		"      --quiet-to=MIN        end of the quiet-hours window (exclusive); equal to\n"
+		"                            --quiet-from (the default) disables the window\n"
+		"      --quiet-gain=GAIN     gain [0..100] used inside the window (default 0)\n"
+		"      --gain-at=MIN         print the gain a click at MIN would play at, and exit\n",
 		exe
        );
 }
@@ -492,7 +589,7 @@ int play(int code, int press)
 		if (opt_stereo_width > 0) {
 			alSource3f(snd_src[idx], AL_POSITION, -x, 0, (100 - opt_stereo_width) / 100.0);
 		}
-		alSourcef(snd_src[idx], AL_GAIN, opt_gain / 100.0);
+		applied_gain[idx] = -1;   /* no gain applied yet; the per-play block below sets it */
 
 		alSourcei(snd_src[idx], AL_BUFFER, snd_buf[idx]);
 		(void)alGetError();   /* non-fatal: a transient bind error won't kill the daemon */
@@ -500,6 +597,18 @@ int play(int code, int press)
 
 
 	if(snd_src[idx] != 0 && snd_src[idx] != SRC_INVALID) {
+		/* Gain belongs on the PER-PLAY path, not the source-creation branch: sources are
+		 * cached per (keycode, press) for the process lifetime, so setting it at creation
+		 * froze each key's gain at its first press — no quiet window could ever take
+		 * effect on a key already typed. Guarded by the applied_gain compare, so in steady
+		 * state this costs one integer compare and zero OpenAL calls; only the first press
+		 * of each key after a window boundary pays a single alSourcef. */
+		int gain = effective_gain();
+		if (gain != applied_gain[idx]) {
+			alSourcef(snd_src[idx], AL_GAIN, gain / 100.0);
+			applied_gain[idx] = gain;
+			printd("gain %d%% applied to source %d", gain, idx);
+		}
 		if (!muted)
 			alSourcePlay(snd_src[idx]);
 		error = alGetError();
