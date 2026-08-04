@@ -82,18 +82,29 @@ ensure_binary() {
 
   [ "${1:-}" = nobuild ] && { [[ -x "$bin" ]]; return; }
 
-  # Build (or rebuild) in a popup so the user sees progress and any errors. Only
-  # run the slow dependency bootstrap when the deps are actually missing.
-  local build_cmd="cd '$BUCKLE_DIR'"
-  if [[ "$(uname)" == "Darwin" && ! -e "$BUCKLE_DIR/mac/lib/pkgconfig/openal.pc" ]]; then
-    build_cmd+=" && ./setup-macos.sh && make"
-  else
-    build_cmd+=" && make"
-  fi
-  build_cmd+=" && echo && echo 'Build complete. Press ENTER to close.' && read"
-
-  tmux display-popup -E -xC -yC -w 80% -h 60% "$build_cmd"
+  # Re-enter this script with one argv so the popup's fish shell never owns
+  # build control flow or status handling.
+  tmux display-popup -E -xC -yC -w 80% -h 60% \
+    "'$SELF' build-popup '$BUCKLE_DIR'"
   [[ -x "$bin" ]]
+}
+
+_build() {                               # directory
+  local dir=$1
+  cd "$dir"
+  if [[ "$(uname)" == "Darwin" && ! -e "$dir/mac/lib/pkgconfig/openal.pc" ]]; then
+    ./setup-macos.sh && make
+  else
+    make
+  fi
+}
+
+build_popup() {                          # internal popup-body arm
+  local dir=${1:?missing build directory} rc=0
+  _build "$dir" || rc=$?
+  printf '\npress any key to close\n'
+  IFS= read -rsn1 _ || true
+  exit "$rc"
 }
 
 do_start() {
@@ -362,5 +373,6 @@ case "${1:-}" in
   icon-refresh) refresh_icon ;;
   verify-start) do_verify_start ;;           # deferred self-correct target from do_start (was icon-refresh)
   open-perms)   open_perms ;;
+  build-popup)  build_popup "${2:?missing build directory}" ;;
   *)            printf 'Usage: plugin.sh init|teardown|purge|doctor|attach|menu|start|stop|toggle|gain|quiet-commit|restore|icon|icon-refresh|verify-start|open-perms\n'; exit 1 ;;
 esac

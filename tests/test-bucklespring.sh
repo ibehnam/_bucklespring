@@ -397,6 +397,21 @@ test_restore_is_idempotent_when_running() {
     "$(tmux show -gqv @buckle_icon_color)" "colour84"
 }
 
+test_failed_build_popup_holds_and_preserves_rc() {
+  local fail_dir="$TS_TMP/failing build" output rc
+  mkdir -p "$fail_dir/mac/lib/pkgconfig"
+  : > "$fail_dir/mac/lib/pkgconfig/openal.pc"
+  printf '#!/usr/bin/env bash\nprintf "build failed visibly\\n"\nexit 7\n' > "$TS_SHIMDIR/make"
+  chmod +x "$TS_SHIMDIR/make"
+  output=$(printf q | bash "$BUCKLE" build-popup "$fail_dir" 2>&1); rc=$?
+  assert_eq "buckle build popup: failed build rc survives the hold" "7" "$rc"
+  assert_contains "buckle build popup: failure output remains readable" \
+    "$output" "build failed visibly"
+  assert_contains "buckle build popup: failure still reaches the any-key hold" \
+    "$output" "press any key to close"
+  rm -f "$TS_SHIMDIR/make"
+}
+
 test_menu_sticky
 test_menu_quiet_row
 test_quiet_commit_restarts_running
@@ -407,4 +422,5 @@ test_gain_at_parity
 test_restore_starts_enabled
 test_restore_keeps_disabled_off
 test_restore_is_idempotent_when_running
+test_failed_build_popup_holds_and_preserves_rc
 finish
