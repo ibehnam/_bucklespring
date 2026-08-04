@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 # Bucklespring plugin Layer A menu + lifecycle coverage.
 #
-# The menu coverage guards the ONE thing the universal sticky-menu change put at risk:
-# universal sticky-menu change put at risk in a file that had no test: the positional
-# <reopen> arg threaded through tmux_menu_radio_rows / tmux_menu_volume_rows. Because <reopen>
-# sits BEFORE the variadic items, a forgotten arg does not error — `shift 5` silently eats the
-# first item and drops that row — so without this file a missed edit here would pass CI. We
-# assert every actionable archetype (profile radio, volume radio, Start/Stop toggle) chains
-# `; …/plugin.sh menu` after its pure mutation. Restore coverage proves persisted
-# intent is reconciled idempotently without launching the real daemon or opening a build popup.
+# Menu coverage asserts every actionable archetype (profile radio, volume radio, Start/Stop
+# toggle) receives the constructor-derived sticky reopen. Lifecycle coverage proves pidfile
+# identity, orphan-free profile switches, and init/restore reconciliation without opening a
+# build popup.
 #
 # SEAM: plugin.sh's CLI case has no source-guard (sourcing it would run the case),
 # so we run `menu` as a SUBPROCESS behind a display-menu-capturing `tmux` shim (mirrors
@@ -26,13 +22,14 @@ BUCKLE="$HERE/../plugin.sh"
 REAL_BUCKLE_BIN="$HERE/../buckle"
 
 tsetup
-HOLDER_PID=""
 cleanup() {
   if [ -f "$BUCKLE_PIDFILE" ]; then
     pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) || pid=""
     [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
   fi
-  [ -n "$HOLDER_PID" ] && kill -KILL "$HOLDER_PID" 2>/dev/null || true
+  if [ -f "${BUCKLE_PID_LOG:-}" ]; then
+    while read -r pid; do kill -KILL "$pid" 2>/dev/null || true; done < "$BUCKLE_PID_LOG"
+  fi
   tteardown
 }
 trap cleanup EXIT
@@ -66,23 +63,22 @@ exec "$REAL_TMUX" -L "$TS_SOCK" "\$@"
 SHIM
 chmod +x "$TS_SHIMDIR/tmux"
 
-# Deterministic process-liveness shim: the marker models an already-running
-# daemon, independent of any real buckle process on the development machine.
-BUCKLE_RUNNING="$TS_TMP/buckle.running"
+# Deterministic process-liveness shim: fake launches record their own pid, and pgrep reports the
+# union of live recorded instances. That makes multiple survivors observable.
 BUCKLE_CACHE_DIR="$TS_TMP/buckle-cache"
 BUCKLE_PIDFILE="$BUCKLE_CACHE_DIR/buckle.pid"
 BUCKLE_LOG="$BUCKLE_CACHE_DIR/buckle.log"
-export BUCKLE_CACHE_DIR BUCKLE_PIDFILE BUCKLE_LOG
-export BUCKLE_RUNNING
+BUCKLE_PID_LOG="$TS_TMP/buckle.pids"
+export BUCKLE_CACHE_DIR BUCKLE_PIDFILE BUCKLE_LOG BUCKLE_PID_LOG
 cat > "$TS_SHIMDIR/pgrep" <<'SHIM'
 #!/usr/bin/env bash
-if [ "${1:-}" = -x ] && [ "${2:-}" = buckle ] && [ -f "$BUCKLE_RUNNING" ]; then
-  pid=$(cat "$BUCKLE_RUNNING" 2>/dev/null) || exit 1
-  kill -0 "$pid" 2>/dev/null || exit 1
-  printf '%s\n' "$pid"
-  exit 0
+found=1
+if [ "${1:-}" = -x ] && [ "${2:-}" = buckle ] && [ -f "$BUCKLE_PID_LOG" ]; then
+  while read -r pid; do
+    if kill -0 "$pid" 2>/dev/null; then printf '%s\n' "$pid"; found=0; fi
+  done < "$BUCKLE_PID_LOG"
 fi
-exit 1
+exit "$found"
 SHIM
 chmod +x "$TS_SHIMDIR/pgrep"
 
@@ -95,6 +91,7 @@ mkdir -p "$FAKE_BUCKLE_DIR"
 cat > "$FAKE_BUCKLE_DIR/buckle" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$BUCKLE_LAUNCH_LOG"
+printf '%s\n' "$$" >> "$BUCKLE_PID_LOG"
 if [ "${BUCKLE_FAKE_LINGER:-}" = 1 ]; then
   trap 'exit 0' TERM INT
   while :; do sleep 0.2 & wait $!; done
@@ -122,20 +119,38 @@ wait_for_launch() {
   done
 }
 
+live_launch_pids() {
+  [ -f "$BUCKLE_PID_LOG" ] || return 0
+  while read -r pid; do kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"; done < "$BUCKLE_PID_LOG"
+}
+
+live_launch_count() {
+  live_launch_pids | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+wait_live_count() { # count
+  local want="$1" i=0
+  while [ "$i" -lt 80 ] && [ "$(live_launch_count)" != "$want" ]; do
+    perl -e 'select(undef,undef,undef,0.05)' 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  [ "$(live_launch_count)" = "$want" ]
+}
+
 mark_running() {
   clear_running
-  sleep 300 & HOLDER_PID=$!
-  printf '%s\n' "$HOLDER_PID" > "$BUCKLE_RUNNING"
+  sleep 300 &
+  printf '%s\n' "$!" >> "$BUCKLE_PID_LOG"
 }
 
 clear_running() {
-  if [ -f "$BUCKLE_RUNNING" ]; then
-    pid=$(cat "$BUCKLE_RUNNING" 2>/dev/null) || pid=""
-    [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
-    [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+  if [ -f "$BUCKLE_PID_LOG" ]; then
+    while read -r pid; do
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    done < "$BUCKLE_PID_LOG"
   fi
-  rm -f "$BUCKLE_RUNNING" "$BUCKLE_PIDFILE"
-  HOLDER_PID=""
+  rm -f "$BUCKLE_PID_LOG" "$BUCKLE_PIDFILE"
 }
 
 # --- The menu is present and every actionable row chains the reopen (sticky) --------
@@ -243,23 +258,63 @@ test_quiet_commit_restarts_running() {
   clear_running
 }
 
-test_pidfile_start_stop() {
+_assert_pidfile_start_stop_shell() { # shell label
+  local shell="$1" label="$2" pid launched
   clear_running
-  rm -f "$BUCKLE_LAUNCH_LOG" "$BUCKLE_PIDFILE"
-  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" start default
-  assert_rc0 "buckle daemon: start writes a pidfile" wait_file "$BUCKLE_PIDFILE"
-  local pid ppid="" i=0
+  rm -f "$BUCKLE_LAUNCH_LOG"
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" "$shell" "$BUCKLE" start default
+  assert_rc0 "buckle daemon ($label): start writes a pidfile" wait_file "$BUCKLE_PIDFILE"
+  assert_rc0 "buckle daemon ($label): fake daemon records its pid" wait_file "$BUCKLE_PID_LOG"
   pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null)
-  while [ "$i" -lt 50 ]; do
-    ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
-    [ "$ppid" = 1 ] && break
-    perl -e 'select(undef,undef,undef,0.1)' 2>/dev/null || sleep 1
-    i=$((i + 1))
-  done
-  assert_eq "buckle daemon: launched process is reparented to init" 1 "$ppid"
+  launched=$(tail -n 1 "$BUCKLE_PID_LOG" 2>/dev/null)
+  assert_eq "buckle daemon ($label): pidfile names the fake daemon itself" "$launched" "$pid"
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" "$shell" "$BUCKLE" stop
+  assert_rc0 "buckle daemon ($label): stop kills the daemon" wait_dead "$pid"
+  assert_rc0 "buckle daemon ($label): no fake instance survives stop" wait_live_count 0
+  assert_rc1 "buckle daemon ($label): stop removes the pidfile" test -e "$BUCKLE_PIDFILE"
+}
+
+test_pidfile_start_stop() {
+  _assert_pidfile_start_stop_shell bash PATH-bash
+  _assert_pidfile_start_stop_shell /bin/bash system-bash
+}
+
+test_profile_switch_replaces_daemon() {
+  clear_running
+  rm -f "$BUCKLE_LAUNCH_LOG"
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" start "Japanese Black"
+  assert_rc0 "buckle switch: first profile has one live daemon" wait_live_count 1
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" start "Typewriter"
+  assert_rc0 "buckle switch: replacement settles at one live daemon" wait_live_count 1
+  assert_eq "buckle switch: exactly two launches occurred" 2 "$(launch_count)"
+  assert_contains "buckle switch: survivor uses the new profile" \
+    "$(tail -n 1 "$BUCKLE_LAUNCH_LOG")" "-p ./wav-klack/Typewriter/"
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" stop
-  assert_rc0 "buckle daemon: stop kills the pidfile holder" wait_dead "$pid"
-  assert_rc1 "buckle daemon: stop removes the pidfile" test -e "$BUCKLE_PIDFILE"
+  assert_rc0 "buckle switch: final stop leaves no fake" wait_live_count 0
+}
+
+test_plugin_round_trip_resumes_intent() {
+  local overlay="$TS_TMP/plugins.local"
+  clear_running
+  rm -f "$BUCKLE_LAUNCH_LOG" "$overlay"
+  tmux set -g @buckle_enabled 1
+  tmux set -g @buckle_profile default
+
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" TMUX_PLUGINS_LOCAL="$overlay" \
+    "$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh" set bucklespring on
+  assert_rc0 "buckle plugin round-trip: enabled init starts intent" wait_live_count 1
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" TMUX_PLUGINS_LOCAL="$overlay" \
+    "$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh" set bucklespring off
+  assert_rc0 "buckle plugin round-trip: master off stops daemon" wait_live_count 0
+  assert_eq "buckle plugin round-trip: master off preserves enabled preference" 1 \
+    "$(tmux show -gqv @buckle_enabled)"
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" TMUX_PLUGINS_LOCAL="$overlay" \
+    "$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh" set bucklespring on
+  assert_rc0 "buckle plugin round-trip: master on resumes daemon via init" wait_live_count 1
+  assert_eq "buckle plugin round-trip: preference remains enabled" 1 \
+    "$(tmux show -gqv @buckle_enabled)"
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" teardown
+  wait_live_count 0 || true
 }
 
 # --- C/shell parity: ONE table, two implementations of the same rule ----------
@@ -345,6 +400,8 @@ test_menu_sticky
 test_menu_quiet_row
 test_quiet_commit_restarts_running
 test_pidfile_start_stop
+test_profile_switch_replaces_daemon
+test_plugin_round_trip_resumes_intent
 test_gain_at_parity
 test_restore_starts_enabled
 test_restore_keeps_disabled_off

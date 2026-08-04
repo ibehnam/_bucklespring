@@ -119,9 +119,10 @@ do_start() {
   # are written there) instead of discarding it — so audio-routing behaviour is
   # observable and verifiable rather than a black box. Truncated each start.
   mkdir -p "$BUCKLE_CACHE_DIR"
-  # The echo prevents bash's last-command fork elision, so the daemon is
-  # reparented instead of inheriting a sticky menu shell, and records its owner.
-  (cd "$BUCKLE_DIR" && nohup "${cmd[@]}" >"$BUCKLE_LOG" 2>&1 & echo $! >"$BUCKLE_PIDFILE")
+  # Keep cwd scoped while making the background job itself become buckle. The recorded $! is
+  # therefore the daemon, not a compound-command wrapper that cannot forward TERM.
+  ( cd "$BUCKLE_DIR" && exec nohup "${cmd[@]}" >"$BUCKLE_LOG" 2>&1 ) &
+  printf '%s\n' "$!" >"$BUCKLE_PIDFILE"
   refresh_icon 1   # optimistic green now — don't make the icon wait on the fork to settle
   # Async self-correct via tmux's native deferred background run — must NOT block a
   # sticky-menu reopen chained right after this call (tmux_menu_action's `; <reopen>`),
@@ -156,15 +157,12 @@ do_verify_start() {
 
 do_teardown() {
   local pid
-  if [ -f "$BUCKLE_PIDFILE" ]; then
-    tmux_daemon_stop "$BUCKLE_PIDFILE" || true
-  else
-    # One migration-only sweep for a pre-pidfile orphan. Match the exact
-    # executable and signal its resolved PIDs; never use substring matching.
-    for pid in $(pgrep -x buckle 2>/dev/null || true); do
-      kill "$pid" 2>/dev/null || true
-    done
-  fi
+  tmux_daemon_stop "$BUCKLE_PIDFILE" || true
+  # Always sweep the declared exact executable. This removes pre-fix wrapper-orphans on profile
+  # switches and first Stop, including when the pidfile existed but named the wrong process.
+  for pid in $(pgrep -x buckle 2>/dev/null || true); do
+    _tmux_daemon_term_wait "$pid" || kill -KILL "$pid" 2>/dev/null || true
+  done
   tmux set -gu @buckle_perm_error   # deliberate stop always renders red, never orange
   tmux set -gu @buckle_icon_color
 }
@@ -213,8 +211,17 @@ do_quiet_commit() {
   tmux run-shell -b "TMUX_MENU_SELECT=${TMUX_MENU_SELECT:-} '$SELF' menu - ${1:-}" >/dev/null 2>&1 || true
 }
 
-# Seed preferences only when absent and paint observed state. Init deliberately
-# never launches: resurrect restore owns the persisted-intent start decision.
+# Reconcile persisted intent without interactive UI. This is shared by init and restore so config
+# load, attach, plugin enable, and resurrect all converge through one idempotent path.
+reconcile_intent() {
+  if [ "$(tmux show -gqv @buckle_enabled 2>/dev/null)" = "1" ] && ! is_running; then
+    do_start "$(current_profile)" nobuild || refresh_icon
+  else
+    refresh_icon
+  fi
+}
+
+# Seed preferences only when absent, then fully reconcile intent to process state.
 do_init() {
   [ -n "$(tmux show -gqv @buckle_quiet_from 2>/dev/null)" ] || tmux set -g @buckle_quiet_from 0
   [ -n "$(tmux show -gqv @buckle_quiet_to 2>/dev/null)" ] || tmux set -g @buckle_quiet_to 0
@@ -222,19 +229,12 @@ do_init() {
   [ -n "$(tmux show -gqv @buckle_profile 2>/dev/null)" ] || tmux set -g @buckle_profile default
   [ -n "$(tmux show -gqv @buckle_gain 2>/dev/null)" ] || tmux set -g @buckle_gain 100
   tmux set -g @buckle_icon_color ''
-  refresh_icon
+  reconcile_intent
 }
 
-# Reconcile persisted intent after status-state has been restored. This is the
-# only unattended start path, so it never opens a build popup: an existing
-# executable may run even when sources are stale, while a missing binary leaves
-# buckle off and repaints the observed state.
+# Restore is a lifecycle alias for the same unattended reconciler.
 do_restore() {
-  if [ "$(tmux show -gqv @buckle_enabled 2>/dev/null)" = "1" ] && ! is_running; then
-    do_start "$(current_profile)" nobuild || refresh_icon
-  else
-    refresh_icon
-  fi
+  reconcile_intent
 }
 
 show_icon() {
@@ -273,14 +273,10 @@ open_perms() {
 show_menu() {
   local back_b64="${1:-}"
   local current; current="$(current_profile)"
-  # Sticky reopen: each actionable row chains "… menu" after its pure mutation (via
-  # tmux_menu_action's `;` shell chain) so profile/volume/Start-Stop flip in one pass;
-  # Esc/q dismisses. The reopen rides the ROW COMMAND, never the start/gain/toggle
-  # subcommands themselves — those are reused by the CLI/icon call sites and stay pure.
+  # Sticky reopen is declared once as constructor metadata. Toggle rows stay pure; compose
+  # derives each row's index and owns the action + reopen chain.
   local reopen="$SELF menu -${back_b64:+ $back_b64}"
-  # Options split from row triples so sticky rows can self-index (tmux_menu_next_index).
-  local -a opts=(-T "#[align=centre]BUCKLESPRING" -x R -y S)
-  local -a args=()
+  local -a rows=("self"$'\t'"$reopen")
 
   # Profile picker via the shared radio engine: built-in default first, then discovered packs.
   local -a items=( "default"$'\t'"IBM Model-M (default)" )
@@ -290,39 +286,37 @@ show_menu() {
       items+=( "$name"$'\t'"$name" )
     done < <(find "$BUCKLE_DIR/wav-klack" -mindepth 1 -maxdepth 1 -type d | sort)
   fi
-  tmux_menu_radio_rows args "$current" "$SELF start" 0 "$reopen" "${items[@]}"
+  tmux_menu_radio_rows rows "$current" "$SELF start" 0 "${items[@]}"
 
   # Divider between the sound-picker section and the volume section, then the volume group
   # (keys continue after the profiles: next free key = item count). Bold the EFFECTIVE
   # level (quiet window applied), not the raw @buckle_gain, so the mark matches what buckle
   # actually plays right now — symmetric with notif.
-  args+=("" "" "")
-  tmux_menu_volume_rows args \
+  rows+=("separator")
+  tmux_menu_volume_rows rows \
     "$(tmux_volume_effective "$(current_gain)" "$(quiet_from)" "$(quiet_to)")" \
-    "$SELF gain" "${#items[@]}" "$reopen"
+    "$SELF gain" "${#items[@]}"
 
   # Separator + the quiet window that caps those levels — same shared row as notif's, and
   # ABOVE the conditional perm_error row below so every sticky index baked in at build time
   # stays valid in the rebuilt menu (docs/ui/menus.md).
-  args+=("" "" "")
-  tmux_menu_quiet_row args "$(quiet_from)" "$(quiet_to)" h \
+  rows+=("separator")
+  tmux_menu_quiet_row rows "$(quiet_from)" "$(quiet_to)" h \
     @buckle_quiet_input "$SELF quiet-commit${back_b64:+ $back_b64}"
 
   # (existing) separator + Start/Stop toggle — unchanged; serves as the volume|toggle divider.
-  args+=("" "" "")
+  rows+=("separator")
   local on; is_running && on=1 || on=0
-  args+=( "$(tmux_menu_toggle_label "$on" Stop Start)" s "$(tmux_menu_action "$SELF toggle" "$reopen" "$(tmux_menu_next_index args)")" )
+  rows+=("toggle"$'\t'"$(tmux_menu_toggle_label "$on" Stop Start)"$'\t's$'\t'"$SELF toggle")
 
   # One-click fix affordance: only while the last start failed the TCC-gated event tap.
   # One-shot (no reopen) — opening System Settings takes focus away from tmux anyway.
   if perm_error; then
-    args+=("" "" "")
-    args+=( "⚠ Grant permission → open Settings" p "$(tmux_menu_action "$SELF open-perms")" )
+    rows+=("separator")
+    rows+=("direct"$'\t''⚠ Grant permission → open Settings'$'\t'p$'\t'"$(tmux_menu_action "$SELF open-perms")")
   fi
 
-  tmux_menu_back_row args "$back_b64"
-  tmux_menu_select_opt opts
-  tmux display-menu "${opts[@]}" "${args[@]}"
+  tmux_menu_show BUCKLESPRING "$(tmux_menu_decode "$back_b64")" "${rows[@]}"
 }
 
 do_doctor() {
