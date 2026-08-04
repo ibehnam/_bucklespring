@@ -22,6 +22,7 @@ BUCKLE="$HERE/../plugin.sh"
 REAL_BUCKLE_BIN="$HERE/../buckle"
 
 tsetup
+export XDG_CACHE_HOME="$TS_TMP/cache"
 cleanup() {
   if [ -f "$BUCKLE_PIDFILE" ]; then
     pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) || pid=""
