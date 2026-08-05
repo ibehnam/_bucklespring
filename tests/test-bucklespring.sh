@@ -166,6 +166,8 @@ test_menu_sticky() {
   local dump; dump="$(cat "$MENU_ARGS")"
 
   assert_contains "buckle: title present"                              "$dump" "BUCKLESPRING"
+  assert_contains "buckle: default profile uses constructor-owned tag join" \
+    "$dump" "IBM Model-M  (default)"
   # Profile radio (the built-in default is always present), volume radio (100 is always a
   # level), and the Start/Stop toggle — each chains `; TMUX_MENU_SELECT=<idx> <self> menu`
   # via tmux_menu_action so the reopened menu keeps its highlight. Only the default profile's

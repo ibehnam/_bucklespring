@@ -162,7 +162,7 @@ do_verify_start() {
   fi
   refresh_icon
   if perm_error; then
-    tmux_msg -d 4 "bucklespring: grant your terminal Accessibility (System Settings ▸ Privacy & Security), then restart — prefix-a b s"
+    tmux_msg --class warning -d 4 "Bucklespring needs Accessibility permission — grant it in System Settings ▸ Privacy & Security, restart, then use prefix-a b s"
   fi
 }
 
@@ -290,7 +290,7 @@ show_menu() {
   local -a rows=("self"$'\t'"$reopen")
 
   # Profile picker via the shared radio engine: built-in default first, then discovered packs.
-  local -a items=( "default"$'\t'"IBM Model-M (default)" )
+  local -a items=( "default"$'\t'"IBM Model-M${TMUX_MENU_FS}(default)" )
   if [[ -d "$BUCKLE_DIR/wav-klack" ]]; then
     while IFS= read -r dir; do
       local name; name="$(basename "$dir")"
