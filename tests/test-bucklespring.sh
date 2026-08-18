@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bucklespring plugin Layer A menu + lifecycle coverage.
+# Bucklespring plugin menu + lifecycle coverage.
 #
 # Menu coverage asserts every actionable archetype (profile radio, volume radio, Start/Stop
 # toggle) receives the constructor-derived sticky reopen. Lifecycle coverage proves pidfile
