@@ -11,7 +11,11 @@
 # test-notif.sh / test-dashboard.sh). `show_menu` reaches the world only through `tmux show`
 # (→ the isolated -L server) and deterministic `pgrep`/fake-buckle shims; nothing real is
 # launched or built.
+#
+# LANE: integration
+# BUDGET: 20
 
+set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TMUX_CONFIG_DIR="${TMUX_CONFIG_DIR:-$(cd "$HERE/../../.." && pwd)}"
 export TMUX_CONFIG_DIR
@@ -95,6 +99,7 @@ printf '%s\n' "$*" >> "$BUCKLE_LAUNCH_LOG"
 printf '%s\n' "$$" >> "$BUCKLE_PID_LOG"
 if [ "${BUCKLE_FAKE_LINGER:-}" = 1 ]; then
   trap 'exit 0' TERM INT
+  # sleep: hold — stay alive (killable) until the test tears the fake down
   while :; do sleep 0.2 & wait $!; done
 fi
 SHIM
@@ -115,7 +120,7 @@ launch_count() {
 wait_for_launch() {
   local i=0
   while [ "$i" -lt 50 ] && [ "$(launch_count)" -lt 1 ]; do
-    perl -e 'select(undef,undef,undef,0.02)' 2>/dev/null || sleep 1
+    perl -e 'select(undef,undef,undef,0.02)' 2>/dev/null || sleep 1 # sleep: guard — retry tick; the 50-try cap pins the bound
     i=$((i + 1))
   done
 }
@@ -132,7 +137,7 @@ live_launch_count() {
 wait_live_count() { # count
   local want="$1" i=0
   while [ "$i" -lt 80 ] && [ "$(live_launch_count)" != "$want" ]; do
-    perl -e 'select(undef,undef,undef,0.05)' 2>/dev/null || sleep 1
+    perl -e 'select(undef,undef,undef,0.05)' 2>/dev/null || sleep 1 # sleep: guard — retry tick; the 80-try cap pins the bound
     i=$((i + 1))
   done
   [ "$(live_launch_count)" = "$want" ]
@@ -140,7 +145,7 @@ wait_live_count() { # count
 
 mark_running() {
   clear_running
-  sleep 300 &
+  sleep 300 & # sleep: hold — the sleep process IS the fake live instance
   printf '%s\n' "$!" >> "$BUCKLE_PID_LOG"
 }
 
