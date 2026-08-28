@@ -84,7 +84,7 @@ ensure_binary() {
 
   # Re-enter this script with one argv so the popup's fish shell never owns
   # build control flow or status handling.
-  tmux display-popup -E -xC -yC -w 80% -h 60% \
+  tmux_popup -E -xC -yC -w 80% -h 60% \
     "'$SELF' build-popup '$BUCKLE_DIR'"
   [[ -x "$bin" ]]
 }
