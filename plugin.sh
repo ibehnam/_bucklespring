@@ -162,7 +162,7 @@ do_verify_start() {
   fi
   refresh_icon
   if perm_error; then
-    tmux_msg --class warning -d 4 "Bucklespring needs Accessibility permission — grant it in System Settings ▸ Privacy & Security, restart, then use prefix-a b s"
+    tmux_msg --class warning -d 4 "Bucklespring needs Accessibility permission; grant it in System Settings, Privacy & Security, restart, then use prefix-a b s"
   fi
 }
 
