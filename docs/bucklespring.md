@@ -2,6 +2,12 @@
 
 The bucklespring plugin controller owns start/stop, profile, gain, quiet hours, icon state, permission guidance, and rebuilding. Profiles are discovered from sound directories.
 
+`buckle_profile_rows` supplies the ordered profile list to the shell menu, launch validator,
+and compiler-only `menu-authority` command. The compiler executes this owner and mirrors its
+profiles and absolute pidfile path for native menus. Launch validation runs again when an
+action executes, so a removed profile cannot stop the current process and start an invalid
+replacement. See [the ownership lessons](lessons.md).
+
 Buckle is a detached daemon in the tmux server process group. The pidfile stores the `buckle` process, not a shell wrapper. Stop always removes that holder and all exact-name `buckle` processes.
 
 `@buckle_enabled`, `@buckle_gain`, `@buckle_profile`, and the quiet-window bounds use the shared state file. `init` reconciles this intent with process state. `restore` calls the same reconciler. Both paths use the existing executable and never open a build popup.

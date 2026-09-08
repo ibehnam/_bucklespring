@@ -18,6 +18,50 @@ BUCKLE_CACHE_DIR="${BUCKLE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tmux-buckl
 BUCKLE_LOG="${BUCKLE_LOG:-$BUCKLE_CACHE_DIR/buckle.log}"
 BUCKLE_PIDFILE="${BUCKLE_PIDFILE:-$BUCKLE_CACHE_DIR/buckle.pid}"
 
+# The profile enumeration is shared by the shell menu, action validator, and
+# compiled native-menu authority.  A profile name is a directory component,
+# never an arbitrary path supplied by a menu callback.
+buckle_profile_rows() { # prints value<TAB>legacy menu label
+  printf 'default\tIBM Model-M%s(default)\n' "$TMUX_MENU_FS"
+  local dir name
+  [[ -d "$BUCKLE_DIR/wav-klack" ]] || return 0
+  while IFS= read -r dir; do
+    name=${dir##*/}
+    case "$name" in
+      ''|*/*|*$'\t'*|*$'\n'*|*$'\r'*|*$'\036'*|*$'\037'*) continue ;;
+    esac
+    printf '%s\t%s\n' "$name" "$name"
+  done < <(find "$BUCKLE_DIR/wav-klack" -mindepth 1 -maxdepth 1 -type d | sort)
+}
+
+buckle_profile_valid() { # profile
+  local value label
+  while IFS=$'\t' read -r value label; do
+    [ "$value" = "$1" ] && return 0
+  done < <(buckle_profile_rows)
+  return 1
+}
+
+buckle_absolute_path() { # path
+  local path="$1"
+  case "$path" in
+    /*) printf '%s' "$path" ;;
+    *) printf '%s/%s' "$PWD" "$path" ;;
+  esac
+}
+
+# Compiler-only authority.  The compiler EXECUTES this owner; it never sources
+# the plug-in or its UI/lifecycle libraries into its own process.
+menu_authority() {
+  local value label joined="" sep=""
+  while IFS=$'\t' read -r value label; do
+    joined+="$sep$value"$'\t'"$label"
+    sep=$'\036'
+  done < <(buckle_profile_rows)
+  printf '@menu_buckle_profiles\t%s\n' "$joined"
+  printf '@menu_buckle_pidfile\t%s\n' "$(buckle_absolute_path "$BUCKLE_PIDFILE")"
+}
+
 is_running() {
   tmux_daemon_is_live "$BUCKLE_PIDFILE" || pgrep -x buckle >/dev/null 2>&1
 }
@@ -34,7 +78,9 @@ perm_error() {
 current_profile() {
   local p
   p="$(tmux show -gqv @buckle_profile 2>/dev/null)" || true
-  printf '%s' "${p:-default}"
+  p="${p:-default}"
+  buckle_profile_valid "$p" || p=default
+  printf '%s' "$p"
 }
 
 # The selected gain (volume) percent; default 100 (full) when unset, then snapped onto the nearest
@@ -109,6 +155,10 @@ build_popup() {                          # internal popup-body arm
 
 do_start() {
   local profile="${1:-default}"
+  buckle_profile_valid "$profile" || {
+    printf 'bucklespring: unknown profile: %s\n' "$profile" >&2
+    return 2
+  }
   is_running && do_stop
 
   ensure_binary "${2:-}" || return 1
@@ -219,6 +269,9 @@ do_quiet_commit() {
   else
     tmux_msg --class notice "$TMUX_QUIET_HINT"
   fi
+  # The native menu router owns its validated callback and sticky reopen.  The
+  # shell owns only parse, persistence, restart, and rejection feedback.
+  [ "${1:-}" = --native ] && return 0
   tmux run-shell -b "TMUX_MENU_SELECT=${TMUX_MENU_SELECT:-} '$SELF' menu - ${1:-}" >/dev/null 2>&1 || true
 }
 
@@ -289,14 +342,12 @@ show_menu() {
   local reopen="$SELF menu -${back_b64:+ $back_b64}"
   local -a rows=("self"$'\t'"$reopen")
 
-  # Profile picker via the shared radio engine: built-in default first, then discovered packs.
-  local -a items=( "default"$'\t'"IBM Model-M${TMUX_MENU_FS}(default)" )
-  if [[ -d "$BUCKLE_DIR/wav-klack" ]]; then
-    while IFS= read -r dir; do
-      local name; name="$(basename "$dir")"
-      items+=( "$name"$'\t'"$name" )
-    done < <(find "$BUCKLE_DIR/wav-klack" -mindepth 1 -maxdepth 1 -type d | sort)
-  fi
+  # Profile picker and action validator consume this same enumeration.
+  local -a items=()
+  local value label
+  while IFS=$'\t' read -r value label; do
+    items+=( "$value"$'\t'"$label" )
+  done < <(buckle_profile_rows)
   tmux_menu_radio_rows rows "$current" "$SELF start" 0 "${items[@]}"
 
   # Divider between the sound-picker section and the volume section, then the volume group
@@ -368,11 +419,13 @@ case "${1:-}" in
   toggle)       do_toggle ;;                 # do_toggle owns the icon per branch
   gain)         do_gain "${2:?missing percent}" ;;  # do_start handles the icon when running; nothing to refresh when stopped
   quiet-commit) do_quiet_commit "${2:-}" ;;         # prompt round-trip target from the menu's quiet row
+  menu-authority) menu_authority ;;
+  profile-valid) buckle_profile_valid "${2:-}" ;;
   restore)      do_restore ;;
   icon)         show_icon ;;
   icon-refresh) refresh_icon ;;
   verify-start) do_verify_start ;;           # deferred self-correct target from do_start (was icon-refresh)
   open-perms)   open_perms ;;
   build-popup)  build_popup "${2:?missing build directory}" ;;
-  *)            printf 'Usage: plugin.sh init|teardown|purge|doctor|attach|menu|start|stop|toggle|gain|quiet-commit|restore|icon|icon-refresh|verify-start|open-perms\n'; exit 1 ;;
+  *)            printf 'Usage: plugin.sh init|teardown|purge|doctor|attach|menu|start|stop|toggle|gain|quiet-commit|menu-authority|profile-valid|restore|icon|icon-refresh|verify-start|open-perms\n'; exit 1 ;;
 esac

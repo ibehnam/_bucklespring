@@ -93,6 +93,7 @@ FAKE_BUCKLE_DIR="$TS_TMP/bucklespring"
 BUCKLE_LAUNCH_LOG="$TS_TMP/buckle.launches"
 export BUCKLE_LAUNCH_LOG
 mkdir -p "$FAKE_BUCKLE_DIR"
+mkdir -p "$FAKE_BUCKLE_DIR/wav-klack/Japanese Black" "$FAKE_BUCKLE_DIR/wav-klack/Typewriter"
 cat > "$FAKE_BUCKLE_DIR/buckle" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$BUCKLE_LAUNCH_LOG"
@@ -157,6 +158,38 @@ clear_running() {
     done < "$BUCKLE_PID_LOG"
   fi
   rm -f "$BUCKLE_PID_LOG" "$BUCKLE_PIDFILE"
+}
+
+# --- Native authority: one owner enumerates and validates profiles ------------
+test_native_menu_authority() {
+  local authority option value profiles="" pidfile="" dir name
+  authority="$(bash "$BUCKLE" menu-authority)"
+  while IFS=$'\t' read -r option value; do
+    [ -n "$option" ] || continue
+    case "$option" in
+      @menu_buckle_profiles) profiles="$value" ;;
+      @menu_buckle_pidfile) pidfile="$value" ;;
+    esac
+  done <<< "$authority"
+  assert_contains "buckle authority: default profile is exported" "$profiles" $'default\tIBM Model-M'
+  case "$pidfile" in /*) value=1 ;; *) value=0 ;; esac
+  assert_eq "buckle authority: pidfile is absolute" 1 "$value"
+  assert_rc0 "buckle authority: default profile validates" bash "$BUCKLE" profile-valid default
+  while IFS= read -r dir; do
+    name=${dir##*/}
+    assert_rc0 "buckle authority: discovered profile validates ($name)" \
+      bash "$BUCKLE" profile-valid "$name"
+  done < <(find "$HERE/../wav-klack" -mindepth 1 -maxdepth 1 -type d | sort)
+  assert_rc1 "buckle authority: obsolete profile is refused" \
+    bash "$BUCKLE" profile-valid '__obsolete_profile__'
+
+  # Compiler executes the owner and copies precisely its two values.  It must
+  # not invent a Rust-side directory scan or a cache-path default.
+  "$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh" compile
+  assert_eq "buckle authority: compiler mirrors profiles from owner" "$profiles" \
+    "$(tmux show -gqv @menu_buckle_profiles)"
+  assert_eq "buckle authority: compiler mirrors resolved pidfile from owner" "$pidfile" \
+    "$(tmux show -gqv @menu_buckle_pidfile)"
 }
 
 # --- The menu is present and every actionable row chains the reopen (sticky) --------
@@ -419,6 +452,7 @@ test_failed_build_popup_holds_and_preserves_rc() {
   rm -f "$TS_SHIMDIR/make"
 }
 
+test_native_menu_authority
 test_menu_sticky
 test_menu_quiet_row
 test_quiet_commit_restarts_running
