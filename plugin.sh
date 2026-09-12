@@ -366,10 +366,11 @@ show_menu() {
   tmux_menu_quiet_row rows "$(quiet_from)" "$(quiet_to)" h \
     @buckle_quiet_input "$SELF quiet-commit${back_b64:+ $back_b64}"
 
-  # (existing) separator + Start/Stop toggle — unchanged; serves as the volume|toggle divider.
+  # (existing) separator + Running toggle — serves as the volume|toggle divider. The ✓+bold
+  # checkbox marks the daemon as running, matching every other stateful toggle.
   rows+=("separator")
-  local on; is_running && on=1 || on=0
-  rows+=("toggle"$'\t'"$(tmux_menu_toggle_label "$on" Stop Start)"$'\t's$'\t'"$SELF toggle")
+  local running; is_running && running=on || running=off
+  rows+=("toggle"$'\t'"$(tmux_menu_label on Running "$running")"$'\t's$'\t'"$SELF toggle")
 
   # One-click fix affordance: only while the last start failed the TCC-gated event tap.
   # One-shot (no reopen) — opening System Settings takes focus away from tmux anyway.

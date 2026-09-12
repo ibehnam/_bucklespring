@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bucklespring plugin menu + lifecycle coverage.
 #
-# Menu coverage asserts every actionable archetype (profile radio, volume radio, Start/Stop
+# Menu coverage asserts every actionable archetype (profile radio, volume radio, Running
 # toggle) receives the constructor-derived sticky reopen. Lifecycle coverage proves pidfile
 # identity, orphan-free profile switches, and init/restore reconciliation without opening a
 # build popup.
@@ -207,14 +207,21 @@ test_menu_sticky() {
   assert_contains "buckle: default profile uses constructor-owned tag join" \
     "$dump" "IBM Model-M  (default)"
   # Profile radio (the built-in default is always present), volume radio (100 is always a
-  # level), and the Start/Stop toggle — each chains `; TMUX_MENU_SELECT=<idx> <self> menu`
+  # level), and the Running toggle — each chains `; TMUX_MENU_SELECT=<idx> <self> menu`
   # via tmux_menu_action so the reopened menu keeps its highlight. Only the default profile's
   # index (0) is pinned: the volume/toggle indices shift with the number of wav-klack packs
   # the submodule ships, so those assert the prefix without the number (index math is locked
   # exactly by the notif/awake/name-color/dashboard tests).
   assert_contains "buckle: profile row chains reopen + selection"      "$dump" "start \"default\" ; TMUX_MENU_SELECT=0 $reopen"
   assert_contains "buckle: volume row (100%) chains reopen (sticky)"  "$dump" "gain \"100\" ; TMUX_MENU_SELECT="
-  assert_contains "buckle: Start/Stop row chains reopen (sticky)"     "$dump" "toggle ; TMUX_MENU_SELECT="
+  assert_contains "buckle: Running row chains reopen (sticky)"        "$dump" "toggle ; TMUX_MENU_SELECT="
+  # The daemon toggle is now the shared ✓+bold "Running" checkbox (bold + ✓ when live,
+  # blank gutter when stopped), not a bare Start/Stop verb. The live/stopped byte form is
+  # host-dependent (is_running also greps for a running buckle), so pin the label and the
+  # absence of the retired verb, matching menu.rs's `label == "Running"` fixture.
+  assert_contains "buckle: daemon toggle is the Running checkbox"     "$dump" "Running"
+  assert_not_contains "buckle: the retired Start verb toggle is gone" "$dump" $'\nStart\n'
+  assert_not_contains "buckle: the retired Stop verb toggle is gone"  "$dump" $'\nStop\n'
 }
 
 # --- The quiet row: default OFF, and a set window shown + editable ------------
