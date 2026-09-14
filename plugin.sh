@@ -12,6 +12,8 @@ SELF="$SCRIPT_DIR/plugin.sh"
 . "$AI_DIR/tmux-ui-lib.sh"
 # shellcheck source=tmux-msg.sh
 . "$AI_DIR/tmux-msg.sh"
+# shellcheck source=tmux-apply.sh
+. "$AI_DIR/tmux-apply.sh"
 
 BUCKLE_DIR="${BUCKLE_DIR:-$SCRIPT_DIR}"
 BUCKLE_CACHE_DIR="${BUCKLE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tmux-bucklespring}"
@@ -35,11 +37,11 @@ buckle_profile_rows() { # prints value<TAB>legacy menu label
 }
 
 buckle_profile_valid() { # profile
-  local value label
+  local value label found=1
   while IFS=$'\t' read -r value label; do
-    [ "$value" = "$1" ] && return 0
+    [ "$value" = "$1" ] && found=0
   done < <(buckle_profile_rows)
-  return 1
+  return "$found"
 }
 
 buckle_absolute_path() { # path
@@ -180,10 +182,13 @@ do_start() {
   # are written there) instead of discarding it — so audio-routing behaviour is
   # observable and verifiable rather than a black box. Truncated each start.
   mkdir -p "$BUCKLE_CACHE_DIR"
-  # Keep cwd scoped while making the background job itself become buckle. The recorded $! is
-  # therefore the daemon, not a compound-command wrapper that cannot forward TERM.
-  ( cd "$BUCKLE_DIR" && exec nohup "${cmd[@]}" >"$BUCKLE_LOG" 2>&1 ) &
-  printf '%s\n' "$!" >"$BUCKLE_PIDFILE"
+  # The shared detacher gives the daemon its own session and closes inherited
+  # descriptors. Its lifetime therefore cannot depend on whether this action
+  # came from tmux, a restore script, an SSH session, or a test runner.
+  local pid
+  pid=$(tmux_apply_detach "$BUCKLE_DIR" "$BUCKLE_LOG" "${cmd[@]}") || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$pid" >"$BUCKLE_PIDFILE"
   refresh_icon 1   # optimistic green now — don't make the icon wait on the fork to settle
   # Async self-correct via tmux's native deferred background run — must NOT block a
   # sticky-menu reopen chained right after this call (tmux_menu_action's `; <reopen>`),
@@ -278,10 +283,23 @@ do_quiet_commit() {
 # Reconcile persisted intent without interactive UI. This is shared by init and restore so config
 # load, attach, plugin enable, and resurrect all converge through one idempotent path.
 reconcile_intent() {
-  if [ "$(tmux show -gqv @buckle_enabled 2>/dev/null)" = "1" ] && ! is_running; then
-    do_start "$(current_profile)" nobuild || refresh_icon
+  local enabled running=0
+  enabled="$(tmux show -gqv @buckle_enabled 2>/dev/null)"
+  is_running && running=1
+  if [ "$enabled" = "1" ]; then
+    if [ "$running" = 0 ]; then
+      do_start "$(current_profile)" nobuild || refresh_icon
+    elif [ "${TMUX_PLUGIN_FORCE_CONVERGE:-}" = 1 ]; then
+      do_teardown
+      do_start "$(current_profile)" nobuild || refresh_icon
+    else
+      refresh_icon 1
+    fi
+  elif [ "$running" = 1 ]; then
+    do_teardown
+    refresh_icon 0
   else
-    refresh_icon
+    refresh_icon 0
   fi
 }
 

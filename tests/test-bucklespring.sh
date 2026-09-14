@@ -162,7 +162,7 @@ clear_running() {
 
 # --- Native authority: one owner enumerates and validates profiles ------------
 test_native_menu_authority() {
-  local authority option value profiles="" pidfile="" dir name
+  local authority option value profiles="" pidfile="" dir name validation_stderr validation_rc=0
   authority="$(bash "$BUCKLE" menu-authority)"
   while IFS=$'\t' read -r option value; do
     [ -n "$option" ] || continue
@@ -175,6 +175,10 @@ test_native_menu_authority() {
   case "$pidfile" in /*) value=1 ;; *) value=0 ;; esac
   assert_eq "buckle authority: pidfile is absolute" 1 "$value"
   assert_rc0 "buckle authority: default profile validates" bash "$BUCKLE" profile-valid default
+  validation_stderr="$(bash "$BUCKLE" profile-valid 'Japanese Black' 2>&1 >/dev/null)" \
+    || validation_rc=$?
+  assert_eq "buckle authority: matching profile validates after consuming the registry" 0 "$validation_rc"
+  assert_eq "buckle authority: matching profile emits no broken-pipe diagnostic" "" "$validation_stderr"
   while IFS= read -r dir; do
     name=${dir##*/}
     assert_rc0 "buckle authority: discovered profile validates ($name)" \
@@ -197,7 +201,8 @@ test_menu_sticky() {
   local bdir; bdir="$(cd "$HERE/.." && pwd)"
   local reopen="$bdir/plugin.sh menu -"
 
-  if ! bash "$BUCKLE" menu </dev/null; then
+  if ! TMUX_MENU_RETAIN_PARENT=1 TMUX_MENU_INTERACTIVE=1 \
+    bash "$BUCKLE" menu </dev/null; then
     skip "buckle: \`menu\` did not run (submodule missing?) — cannot assert rows"
     return 0
   fi
@@ -207,14 +212,14 @@ test_menu_sticky() {
   assert_contains "buckle: default profile uses constructor-owned tag join" \
     "$dump" "IBM Model-M  (default)"
   # Profile radio (the built-in default is always present), volume radio (100 is always a
-  # level), and the Running toggle — each chains `; TMUX_MENU_SELECT=<idx> <self> menu`
+  # level), and the Running toggle each chain the interactive update marker, selection, and reopen
   # via tmux_menu_action so the reopened menu keeps its highlight. Only the default profile's
   # index (0) is pinned: the volume/toggle indices shift with the number of wav-klack packs
   # the submodule ships, so those assert the prefix without the number (index math is locked
   # exactly by the notif/awake/name-color/dashboard tests).
-  assert_contains "buckle: profile row chains reopen + selection"      "$dump" "start \"default\" ; TMUX_MENU_SELECT=0 $reopen"
-  assert_contains "buckle: volume row (100%) chains reopen (sticky)"  "$dump" "gain \"100\" ; TMUX_MENU_SELECT="
-  assert_contains "buckle: Running row chains reopen (sticky)"        "$dump" "toggle ; TMUX_MENU_SELECT="
+  assert_contains "buckle: profile row chains reopen + selection"      "$dump" "start \"default\" ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT=0 $reopen"
+  assert_contains "buckle: volume row (100%) chains reopen (sticky)"  "$dump" "gain \"100\" ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT="
+  assert_contains "buckle: Running row chains reopen (sticky)"        "$dump" "toggle ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT="
   # The daemon toggle is now the shared ✓+bold "Running" checkbox (bold + ✓ when live,
   # blank gutter when stopped), not a bare Start/Stop verb. The live/stopped byte form is
   # host-dependent (is_running also greps for a running buckle), so pin the label and the
@@ -240,9 +245,11 @@ test_menu_quiet_row() {
   local dump; dump="$(cat "$MENU_ARGS")"
   assert_contains "buckle quiet: unset window reads off" "$dump" "Quiet hours: off"
   assert_contains "buckle quiet: row carries the prompt round-trip" "$dump" \
-    "$TMUX_CONFIG_DIR/AI/tmux-prompt.sh --prompt '$TMUX_QUIET_HINT: ' --initial '' --allow-empty -- set -g @buckle_quiet_input @@VAL@@ @@SEP@@ run-shell -b 'TMUX_MENU_SELECT="
+    "$TMUX_CONFIG_DIR/AI/tmux-prompt.sh --history quiet-hours --context"
+  assert_contains "buckle quiet: prompt uses the literal-value executable path" "$dump" \
+    "--allow-empty --exec -- /usr/bin/env TMUX_MENU_SELECT="
   assert_contains "buckle quiet: commit target is this script"      "$dump" \
-    "$bdir/plugin.sh quiet-commit'\""
+    "$bdir/plugin.sh quiet-commit --value @@VAL@@"
 
   # A set window shows itself, and the prompt pre-fills with the same label (which
   # tmux_quiet_parse accepts back verbatim, en dash included).
@@ -307,7 +314,7 @@ test_quiet_commit_restarts_running() {
 }
 
 _assert_pidfile_start_stop_shell() { # shell label
-  local shell="$1" label="$2" pid launched
+  local shell="$1" label="$2" pid launched pgid
   clear_running
   rm -f "$BUCKLE_LAUNCH_LOG"
   BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" "$shell" "$BUCKLE" start default
@@ -316,6 +323,8 @@ _assert_pidfile_start_stop_shell() { # shell label
   pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null)
   launched=$(tail -n 1 "$BUCKLE_PID_LOG" 2>/dev/null)
   assert_eq "buckle daemon ($label): pidfile names the fake daemon itself" "$launched" "$pid"
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  assert_eq "buckle daemon ($label): launch owns an isolated process group" "$pid" "$pgid"
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" "$shell" "$BUCKLE" stop
   assert_rc0 "buckle daemon ($label): stop kills the daemon" wait_dead "$pid"
   assert_rc0 "buckle daemon ($label): no fake instance survives stop" wait_live_count 0
@@ -431,6 +440,19 @@ test_restore_keeps_disabled_off() {
     "$(tmux show -gqv @buckle_icon_color)" "colour196"
 }
 
+test_restore_stops_disabled_running() {
+  rm -f "$BUCKLE_LAUNCH_LOG"
+  mark_running
+  tmux set -g @buckle_enabled 0
+
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" restore
+
+  assert_rc0 "buckle restore: disabled intent stops a live daemon" wait_live_count 0
+  assert_eq "buckle restore: disabling launches no replacement" "0" "$(launch_count)"
+  assert_contains "buckle restore: stopped daemon paints the off icon" \
+    "$(tmux show -gqv @buckle_icon_color)" "colour196"
+}
+
 test_restore_is_idempotent_when_running() {
   rm -f "$BUCKLE_LAUNCH_LOG"
   mark_running
@@ -442,6 +464,22 @@ test_restore_is_idempotent_when_running() {
   assert_eq "buckle restore: already-running daemon is not relaunched" "0" "$(launch_count)"
   assert_contains "buckle restore: already-running daemon paints the on icon" \
     "$(tmux show -gqv @buckle_icon_color)" "colour84"
+}
+
+test_forced_restore_restarts_running() {
+  rm -f "$BUCKLE_LAUNCH_LOG"
+  mark_running
+  tmux set -g @buckle_enabled 1
+  tmux set -g @buckle_gain 50
+
+  TMUX_PLUGIN_FORCE_CONVERGE=1 BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" \
+    bash "$BUCKLE" restore
+
+  assert_rc0 "buckle forced restore: replacement settles at one daemon" wait_live_count 1
+  assert_eq "buckle forced restore: running daemon relaunches once" "1" "$(launch_count)"
+  assert_contains "buckle forced restore: latest gain reaches replacement" \
+    "$(cat "$BUCKLE_LAUNCH_LOG" 2>/dev/null)" "-g 50"
+  clear_running
 }
 
 test_failed_build_popup_holds_and_preserves_rc() {
@@ -469,6 +507,8 @@ test_plugin_round_trip_resumes_intent
 test_gain_at_parity
 test_restore_starts_enabled
 test_restore_keeps_disabled_off
+test_restore_stops_disabled_running
 test_restore_is_idempotent_when_running
+test_forced_restore_restarts_running
 test_failed_build_popup_holds_and_preserves_rc
 finish

@@ -8,9 +8,12 @@ profiles and absolute pidfile path for native menus. Launch validation runs agai
 action executes, so a removed profile cannot stop the current process and start an invalid
 replacement. See [the ownership lessons](lessons.md).
 
-Buckle is a detached daemon in the tmux server process group. The pidfile stores the `buckle` process, not a shell wrapper. Stop always removes that holder and all exact-name `buckle` processes.
+Buckle is launched through the shared `tmux_apply_detach` boundary in its own session and process
+group. Its lifetime cannot depend on a transient restore, menu, terminal, or test runner. The
+pidfile stores the exact `buckle` process, rather than a shell wrapper. Stop always removes that
+holder and all exact-name `buckle` processes.
 
-`@buckle_enabled`, `@buckle_gain`, `@buckle_profile`, and the quiet-window bounds use the shared state file. `init` reconciles this intent with process state. `restore` calls the same reconciler. Both paths use the existing executable and never open a build popup.
+`@buckle_enabled`, `@buckle_gain`, `@buckle_profile`, and the quiet-window bounds use the shared state file. `init` reconciles this intent with process state. `restore` calls the same reconciler. A forced plugin convergence replaces an already-running process so new lifecycle code cannot leave an old daemon behind. Both paths use the existing executable and never open a build popup.
 
 Launch-time values need a relaunch to change: gain and the quiet window are baked into the daemon's argv, so a user edit persists always and restarts only a running daemon, and never starts a stopped one. Quiet dimming is opt-in here, with equal bounds meaning off, and the quiet level is derived from the shared level set in the shell so only the time comparison exists in C.
 
