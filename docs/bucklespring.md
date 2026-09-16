@@ -8,8 +8,10 @@ profiles and absolute pidfile path for native menus. Launch validation runs agai
 action executes, so a removed profile cannot stop the current process and start an invalid
 replacement. See [the ownership lessons](lessons.md).
 
-Buckle is launched through the shared `tmux_apply_detach` boundary in its own session and process
-group. Its lifetime cannot depend on a transient restore, menu, terminal, or test runner. The
+Buckle is launched through the shared `tmux_tmuxd_detach` boundary (the daemon's `detach` verb) in
+its own session and process group; when no daemon binary exists yet, it degrades to a plain
+background start so a host still building `tmuxd` can launch it regardless. Its lifetime cannot
+depend on a transient restore, menu, terminal, or test runner. The
 pidfile stores the exact `buckle` process, rather than a shell wrapper. Stop always removes that
 holder and all exact-name `buckle` processes.
 

@@ -12,8 +12,6 @@ SELF="$SCRIPT_DIR/plugin.sh"
 . "$AI_DIR/tmux-ui-lib.sh"
 # shellcheck source=tmux-msg.sh
 . "$AI_DIR/tmux-msg.sh"
-# shellcheck source=tmux-apply.sh
-. "$AI_DIR/tmux-apply.sh"
 
 BUCKLE_DIR="${BUCKLE_DIR:-$SCRIPT_DIR}"
 BUCKLE_CACHE_DIR="${BUCKLE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tmux-bucklespring}"
@@ -186,7 +184,7 @@ do_start() {
   # descriptors. Its lifetime therefore cannot depend on whether this action
   # came from tmux, a restore script, an SSH session, or a test runner.
   local pid
-  pid=$(tmux_apply_detach "$BUCKLE_DIR" "$BUCKLE_LOG" "${cmd[@]}") || return 1
+  pid=$(tmux_tmuxd_detach "$BUCKLE_DIR" "$BUCKLE_LOG" "${cmd[@]}") || return 1
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s\n' "$pid" >"$BUCKLE_PIDFILE"
   refresh_icon 1   # optimistic green now — don't make the icon wait on the fork to settle
