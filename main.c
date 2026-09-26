@@ -10,28 +10,15 @@
 #include <stdbool.h>
 #include <getopt.h>
 #include <time.h>
-#include <stdatomic.h>
-
-#include <AL/al.h>
-#include <AL/alc.h>
-#include <AL/alext.h>
-#include <AL/alure.h>
+#include <math.h>
+#include <signal.h>
 
 #include "buckle.h"
 
-#define SRC_INVALID INT_MAX
 #define DEFAULT_MUTE_KEYCODE 0x46 /* Scroll Lock */
-
-#define TEST_ERROR(_msg)		\
-	error = alGetError();		\
-	if (error != AL_NO_ERROR) {	\
-		fprintf(stderr, _msg "\n");	\
-		exit(1);		\
-	}
 
 
 static void usage(char *exe);
-static void list_devices(void);
 static double find_key_loc(int code);
 
 
@@ -93,6 +80,7 @@ enum {
 	OPT_QUIET_TO,
 	OPT_QUIET_GAIN,
 	OPT_GAIN_AT,
+	OPT_AUDIO_CHECK,
 };
 
 static const char short_opts[] = "d:fg:hlm:Mp:s:cv";
@@ -113,6 +101,7 @@ static const struct option long_opts[] = {
 	{ "quiet-to",       required_argument, NULL, OPT_QUIET_TO },
 	{ "quiet-gain",     required_argument, NULL, OPT_QUIET_GAIN },
 	{ "gain-at",        required_argument, NULL, OPT_GAIN_AT },
+	{ "audio-check",    no_argument,       NULL, OPT_AUDIO_CHECK },
         { 0, 0, 0, 0 }
 };
 
@@ -143,7 +132,7 @@ static int gain_at(int now)
  *     one integer compare, no clock read at all;
  *   • enabled ⇒ time() only — a commpage read, not a syscall — with localtime_r run at
  *     most once per wall-clock minute, so typing speed is irrelevant.
- * localtime_r, not localtime: an ALC event-callback thread runs alongside this one, and
+ * localtime_r, not localtime: CoreAudio notification threads run alongside this one, and
  * localtime() hands back a shared static struct tm.
  */
 static int effective_gain(void)
@@ -165,123 +154,38 @@ static int effective_gain(void)
 }
 
 
+/*
+ * Loaded samples, one backend handle per code + press*256: 0 = not loaded yet,
+ * -1 = the file is missing (tried once, never again). The backend owns the
+ * output device, the mixer and every per-play gain and pan (buckle.h).
+ */
+static int snd[512];
+
 
 /*
- * Audio device + context. openal-soft's CoreAudio backend never migrates to a
- * new default output on its own — it only notifies — so the app must re-point.
- * Its cached device enumeration (alcGetString) is NOT refreshed mid-process, but
- * alcReopenDeviceSOFT(dev, NULL, ...) re-resolves the *live* default via the
- * backend (verified), so on the library's own DefaultDeviceChanged event we flag,
- * and the next play() reopens the existing device+context onto the new default.
- * The process stays put — Stop still works, and sources/buffers survive the reopen.
+ * Termination attribution. This daemon has died silently more than once while its
+ * status icon stayed green, so every exit now leaves a line in the log: the signal
+ * that ended it (TERM from a Stop or a stray kill, HUP, INT), or the fact that the
+ * event-tap run loop returned. Only KILL and a crash stay silent, and a crash
+ * writes its own report. write(2) is the one async-signal-safe way to say it.
  */
-static ALCdevice  *device  = NULL;
-static ALCcontext *context = NULL;
-static LPALCREOPENDEVICESOFT g_reopen = NULL;   /* live default re-resolver */
-static atomic_int g_reacquire = 0;              /* set by the ALC event callback */
-
-/* Lazily-loaded per-key buffers/sources, keyed by code + press*256. */
-static ALuint snd_buf[512] = { 0 };
-static ALuint snd_src[512] = { 0 };
-/* What gain each live source currently carries, so the per-play path issues alSourcef
- * only on an actual CHANGE (steady state: one integer compare, zero OpenAL calls). Seeded
- * to -1 where the source is created — plain static zero-init would be wrong, 0 is a valid
- * gain — which forces the first apply without a separate init loop. */
-static int applied_gain[512];
-
-/* Open the output device + context and make it current. On a fresh process the
- * default specifier resolves to the current system default output. */
-static int open_audio(void)
+static void on_signal(int sig)
 {
-	static const ALfloat listenerOri[] = { 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f };
-	const ALCchar *name = opt_device;
-
-	if (!name) {
-		name = alcGetString(NULL, ALC_DEFAULT_ALL_DEVICES_SPECIFIER);
-	}
-	fprintf(stderr, "buckle: opening OpenAL output device \"%s\"\n", name ? name : "(default)");
-
-	device = alcOpenDevice(name);
-	if (!device) {
-		fprintf(stderr, "buckle: unable to open audio device\n");
-		return -1;
-	}
-
-	context = alcCreateContext(device, NULL);
-	if (!context || !alcMakeContextCurrent(context)) {
-		fprintf(stderr, "buckle: failed to make audio context current\n");
-		if (context) { alcDestroyContext(context); context = NULL; }
-		alcCloseDevice(device);
-		device = NULL;
-		return -1;
-	}
-
-	(void)alGetError();
-	alListener3f(AL_POSITION, 0, 0, 0);
-	alListener3f(AL_VELOCITY, 0, 0, 0);
-	alListenerfv(AL_ORIENTATION, listenerOri);
-	return 0;
+	static const char *const names[] = { [SIGHUP] = "HUP", [SIGINT] = "INT", [SIGTERM] = "TERM" };
+	char buf[64];
+	int n = snprintf(buf, sizeof buf, "buckle: terminated by SIG%s\n",
+	    sig < (int)(sizeof names / sizeof names[0]) && names[sig] ? names[sig] : "?");
+	if (n > 0) (void)!write(2, buf, (size_t)n);
+	_exit(128 + sig);
 }
 
-static void close_audio(void)
+static void attribute_termination(void)
 {
-	alcMakeContextCurrent(NULL);
-	if (context) { alcDestroyContext(context); context = NULL; }
-	if (device)  { alcCloseDevice(device);     device  = NULL; }
-}
-
-/* Re-point the open device+context onto the current system default. Safe to call
- * from the main thread (play()); alcReopenDeviceSOFT preserves sources/buffers. */
-static void reacquire_default(void)
-{
-	if (!g_reopen || !device) return;
-	if (g_reopen(device, NULL, NULL) == ALC_TRUE) {
-		const ALCchar *now = alcGetString(device, ALC_ALL_DEVICES_SPECIFIER);
-		fprintf(stderr, "buckle: followed default to \"%s\"\n", now ? now : "(default)");
-	} else {
-		fprintf(stderr, "buckle: alcReopenDeviceSOFT failed; will retry\n");
-		atomic_store(&g_reacquire, 1);   /* retry on the next keystroke */
-	}
-}
-
-/*
- * openal-soft system-events callback. Runs asynchronously on a background
- * thread, where the spec forbids AL/ALC calls — so it only sets a flag; the
- * next play() performs the reopen on the main thread.
- */
-static void ALC_APIENTRY on_alc_event(ALCenum eventType, ALCenum deviceType,
-				      ALCdevice *dev, ALCsizei length,
-				      const ALCchar *message, void *user)
-{
-	(void)dev; (void)length; (void)message; (void)user;
-	if (eventType == ALC_EVENT_TYPE_DEFAULT_DEVICE_CHANGED_SOFT &&
-	    deviceType == ALC_PLAYBACK_DEVICE_SOFT) {
-		fprintf(stderr, "buckle: default output device changed\n");
-		atomic_store(&g_reacquire, 1);
-	}
-}
-
-/* Subscribe to default-output-device changes via ALC_SOFT_system_events. This
- * reuses the listener openal-soft already runs internally — no second listener. */
-static void subscribe_default_device_events(void)
-{
-	if (!alcIsExtensionPresent(NULL, "ALC_SOFT_system_events")) {
-		fprintf(stderr, "buckle: ALC_SOFT_system_events unavailable; not following default device\n");
-		return;
-	}
-
-	g_reopen = (LPALCREOPENDEVICESOFT) alcGetProcAddress(NULL, "alcReopenDeviceSOFT");
-	LPALCEVENTCONTROLSOFT  event_control  = (LPALCEVENTCONTROLSOFT)  alcGetProcAddress(NULL, "alcEventControlSOFT");
-	LPALCEVENTCALLBACKSOFT event_callback = (LPALCEVENTCALLBACKSOFT) alcGetProcAddress(NULL, "alcEventCallbackSOFT");
-	if (!g_reopen || !event_control || !event_callback) {
-		fprintf(stderr, "buckle: reopen/system-events functions unavailable; not following default device\n");
-		return;
-	}
-
-	const ALCenum events[] = { ALC_EVENT_TYPE_DEFAULT_DEVICE_CHANGED_SOFT };
-	event_callback(on_alc_event, NULL);
-	event_control(1, events, ALC_TRUE);
-	fprintf(stderr, "buckle: following system default output device\n");
+	struct sigaction sa = { 0 };
+	sa.sa_handler = on_signal;
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
 }
 
 
@@ -307,7 +211,7 @@ int main(int argc, char **argv)
 				usage(argv[0]);
 				return 0;
 			case 'l':
-				list_devices();
+				audio_list_devices();
 				return 0;
 			case 'm':
 				opt_mute_keycode = strtol(optarg, NULL, 0);
@@ -346,6 +250,10 @@ int main(int argc, char **argv)
 				 * agree. Reads the gain options parsed BEFORE it on the argv. */
 				printf("%d\n", gain_at(atoi(optarg)));
 				return 0;
+			case OPT_AUDIO_CHECK:
+				/* Open the output (pinned with -d if that came first), prove it
+				 * renders on the device it should, print the verdict, and exit. */
+				return audio_check(opt_device);
 			default:
 				usage(argv[0]);
 				return 1;
@@ -357,6 +265,9 @@ int main(int argc, char **argv)
 		open_console();
 	}
 
+	attribute_termination();
+	fprintf(stderr, "buckle: started, pid %ld\n", (long)getpid());
+
 	/* Path to data files can also be specified by environment, this is
 	 * used by the snap package */
 
@@ -365,25 +276,21 @@ int main(int argc, char **argv)
 		opt_path_audio = env_path;
 	}
 
-	/* Open the output device. When no device was pinned with -d, also follow the
-	 * system default: subscribe to openal-soft's DefaultDeviceChanged event and
-	 * re-exec on change so a fresh process opens the new default. */
+	/* Open the output. Without -d the backend follows the system default output
+	 * for the life of the process; with -d it stays on the named device. */
 
-	if (open_audio() != 0) {
+	if (audio_open(opt_device) != 0) {
 		rv = EXIT_FAILURE;
 		goto out;
-	}
-
-	if (opt_device == NULL) {
-		subscribe_default_device_events();
 	}
 
 	printd("Using wav dir: \"%s\"\n", opt_path_audio);
 
 	scan(opt_verbose);
+	fprintf(stderr, "buckle: event-tap run loop ended; exiting\n");
 
 out:
-	close_audio();
+	audio_close();
 
 	return rv;
 }
@@ -397,14 +304,15 @@ static void usage(char *exe)
 		"\n"
 		"options:\n"
 		"\n"
-		"  -d, --device=DEVICE       use OpenAL audio device DEVICE\n"
+		"  -d, --device=DEVICE       pin output to audio device DEVICE (default: follow the\n"
+		"                            system default output)\n"
 		"  -f, --fallback-sound      use a fallback sound for unknown keys\n"
 		"  -g, --gain=GAIN           set playback gain [0..100]\n"
 		"  -m, --mute-keycode=CODE   use CODE as mute key (default 0x46 for scroll lock)\n"
 		"  -M, --mute                start the program muted\n"
 		"  -c, --no-click            don't play a sound on mouse click\n"
 		"  -h, --help                show help\n"
-		"  -l, --list-devices        list available OpenAL audio devices\n"
+		"  -l, --list-devices        list available audio output devices\n"
 		"  -p, --audio-path=PATH     load .wav files from directory PATH\n"
 		"  -s, --stereo-width=WIDTH  set stereo width [0..100]\n"
 		"  -v, --verbose             increase verbosity / debugging\n"
@@ -412,25 +320,11 @@ static void usage(char *exe)
 		"      --quiet-to=MIN        end of the quiet-hours window (exclusive); equal to\n"
 		"                            --quiet-from (the default) disables the window\n"
 		"      --quiet-gain=GAIN     gain [0..100] used inside the window (default 0)\n"
-		"      --gain-at=MIN         print the gain a click at MIN would play at, and exit\n",
+		"      --gain-at=MIN         print the gain a click at MIN would play at, and exit\n"
+		"      --audio-check         open the output, verify it renders on the expected\n"
+		"                            device, print the verdict, and exit\n",
 		exe
        );
-}
-
-static void list_devices(void)
-{
-	const ALCchar *devices = alcGetString(NULL, ALC_ALL_DEVICES_SPECIFIER);
-	const ALCchar *device = devices, *next = devices + 1;
-	size_t len = 0;
-
-	printf("Available audio devices:");
-	while (device && *device != '\0' && next && *next != '\0') {
-		fprintf(stdout, " \"%s\"", device);
-		len = strlen(device);
-		device += (len + 1);
-		next += (len + 2);
-	}
-	printf("\n");
 }
 
 
@@ -470,6 +364,22 @@ static double find_key_loc(int code)
 		}
 	}
 	return 0;
+}
+
+
+/*
+ * Stereo pan for a key, -1 (left) .. 1 (right). Same geometry as the original
+ * OpenAL placement of the source at (-x, 0, z) with z = (100 - width) / 100 in
+ * front of the listener: the pan is that source's azimuth over a quarter turn,
+ * so width 100 puts every off-centre key hard left or right and width 0 centres all.
+ */
+static double pan_of(int code)
+{
+	double x = find_key_loc(code);
+	double z = (100 - opt_stereo_width) / 100.0;
+
+	if (opt_stereo_width <= 0 || x == 0) return 0;
+	return (x < 0 ? -1 : 1) * atan2(fabs(x), z) / (M_PI / 2);
 }
 
 
@@ -531,20 +441,12 @@ static int wav_code_of(int code)
 
 int play(int code, int press)
 {
-	ALCenum error;
-
 	printd("scancode %d/0x%x", code, code);
 
 	/* Scanner couldn't map this physical key (e.g. Fn/Globe on mac) — drop silently. */
 	if (code == 0) return 0;
 
 	if (code == 0xff && opt_no_click) return 0;
-
-	/* Follow a default-output-device change (flagged by the ALC event callback)
-	 * before this click sounds: alcReopenDeviceSOFT re-points to the live default. */
-	if (atomic_exchange(&g_reacquire, 0)) {
-		reacquire_default();
-	}
 
 	/* Check for mute sequence: ScrollLock down+up+down */
 
@@ -554,68 +456,30 @@ int play(int code, int press)
 
 	int idx = code + press * 256;
 
-	if(snd_src[idx] == 0) {
+	if(snd[idx] == 0) {
 
 		char fname[256];
 		snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, wav_code_of(code), press);
 
 		printd("Loading audio file \"%s\"", fname);
 
-		snd_buf[idx] = alureCreateBufferFromFile(fname);
-		if(snd_buf[idx] == 0) {
-
-			if(opt_fallback_sound) {
-				snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, 0x31, press);
-				snd_buf[idx] = alureCreateBufferFromFile(fname);
-			} else {
-				fprintf(stderr, "Error opening audio file \"%s\": %s\n", fname, alureGetErrorString());
-			}
-
-			if(snd_buf[idx] == 0) {
-				snd_src[idx] = SRC_INVALID;
-				return -1;
-			}
+		snd[idx] = audio_load(fname);
+		if(snd[idx] == 0 && opt_fallback_sound) {
+			snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, 0x31, press);
+			snd[idx] = audio_load(fname);
 		}
-	
-		alGenSources((ALuint)1, &snd_src[idx]);
-		error = alGetError();
-		if (error != AL_NO_ERROR) {
-			fprintf(stderr, "buckle: source generation error 0x%x; dropping click\n", error);
-			snd_src[idx] = 0;
+		if(snd[idx] == 0) {
+			snd[idx] = -1;
 			return -1;
 		}
-
-		double x = find_key_loc(code);
-		if (opt_stereo_width > 0) {
-			alSource3f(snd_src[idx], AL_POSITION, -x, 0, (100 - opt_stereo_width) / 100.0);
-		}
-		applied_gain[idx] = -1;   /* no gain applied yet; the per-play block below sets it */
-
-		alSourcei(snd_src[idx], AL_BUFFER, snd_buf[idx]);
-		(void)alGetError();   /* non-fatal: a transient bind error won't kill the daemon */
 	}
 
-
-	if(snd_src[idx] != 0 && snd_src[idx] != SRC_INVALID) {
-		/* Gain belongs on the PER-PLAY path, not the source-creation branch: sources are
-		 * cached per (keycode, press) for the process lifetime, so setting it at creation
-		 * froze each key's gain at its first press — no quiet window could ever take
-		 * effect on a key already typed. Guarded by the applied_gain compare, so in steady
-		 * state this costs one integer compare and zero OpenAL calls; only the first press
-		 * of each key after a window boundary pays a single alSourcef. */
+	if(snd[idx] > 0 && !muted) {
+		/* Gain belongs on the PER-PLAY path: it is the quiet window's output, evaluated
+		 * against the clock for this click, and the backend applies it to this voice alone. */
 		int gain = effective_gain();
-		if (gain != applied_gain[idx]) {
-			alSourcef(snd_src[idx], AL_GAIN, gain / 100.0);
-			applied_gain[idx] = gain;
-			printd("gain %d%% applied to source %d", gain, idx);
-		}
-		if (!muted)
-			alSourcePlay(snd_src[idx]);
-		error = alGetError();
-		if (error != AL_NO_ERROR) {
-			/* Non-fatal: don't let a transient AL error kill the daemon. */
-			fprintf(stderr, "buckle: playback error 0x%x; dropping click\n", error);
-		}
+		printd("gain %d%% pan %.2f for sample %d", gain, pan_of(code), snd[idx]);
+		return audio_play(snd[idx], pan_of(code), gain);
 	}
 
 	return 0;

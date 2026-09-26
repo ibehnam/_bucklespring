@@ -19,26 +19,26 @@ CFLAGS  += -DPATH_AUDIO=\"$(PATH_AUDIO)\"
 # LDFLAGS += -mwindows -static-libgcc -static-libstdc++
  LDFLAGS += -static-libgcc -static-libstdc++
  LIBS    += -L"win32/lib" -lALURE32 -lOpenAL32
- SRC     += scan-windows.c 
+ SRC     += scan-windows.c audio-openal.c
 else
  OS := $(shell uname)
  ifeq ($(OS), Darwin)
+  # Native CoreAudio output (audio-coreaudio.c): system frameworks only, no OpenAL,
+  # no ALURE, no pkg-config, nothing to set up before `make`.
   BIN     := $(NAME)
-  PKG_CONFIG_PATH := "./mac/lib/pkgconfig" 
-  LIBS    += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs alure openal)
-  CFLAGS  += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags alure openal)
-  LDFLAGS += -framework ApplicationServices -framework Cocoa -framework CoreAudio -Wl,-rpath,@executable_path/mac/lib -Wl,-rpath,/opt/homebrew/opt/openal-soft/lib
-  SRC     += scan-mac.m
+  LDFLAGS += -framework ApplicationServices -framework Cocoa -framework CoreAudio -framework AudioToolbox
+  SRC     += scan-mac.m audio-coreaudio.c
  else
   BIN     := $(NAME)
+  LIBS    += -lm
   ifdef libinput
    LIBS    += $(shell pkg-config --libs openal alure libinput libudev)
    CFLAGS  += $(shell pkg-config --cflags openal alure libinput libudev)
-   SRC     += scan-libinput.c
+   SRC     += scan-libinput.c audio-openal.c
   else
    LIBS    += $(shell pkg-config --libs openal alure xtst x11)
    CFLAGS  += $(shell pkg-config --cflags openal alure xtst x11)
-   SRC     += scan-x11.c
+   SRC     += scan-x11.c audio-openal.c
   endif
  endif
 endif

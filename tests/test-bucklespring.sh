@@ -9,8 +9,10 @@
 # SEAM: plugin.sh's CLI case has no source-guard (sourcing it would run the case),
 # so we run `menu` as a SUBPROCESS behind a display-menu-capturing `tmux` shim (mirrors
 # test-notif.sh / test-dashboard.sh). `show_menu` reaches the world only through `tmux show`
-# (→ the isolated -L server) and deterministic `pgrep`/fake-buckle shims; nothing real is
-# launched or built.
+# (→ the isolated -L server), and every process question goes through THIS suite's pidfile
+# (BUCKLE_PIDFILE under its own cache root) and a fake buckle; nothing real is launched or
+# built. There is deliberately no `pgrep` shim: identity is the pidfile, so the production
+# daemon on this machine is invisible here by construction, and the suite proves that.
 #
 # LANE: integration
 # BUDGET: 20
@@ -27,6 +29,24 @@ REAL_BUCKLE_BIN="$HERE/../buckle"
 
 tsetup
 export XDG_CACHE_HOME="$TS_TMP/cache"
+export XDG_STATE_HOME="$TS_TMP/state"
+# This suite exercises the BASH icon writer. Every compile here (the authority test, each
+# lifecycle round trip) re-reads the plugin layers, and this machine's overlay may switch
+# `tmuxd.bucklespring` on, which correctly hands the cell to a daemon this server does not
+# run. Sandbox the machine layer to an empty file so the switch stays at its shipped default;
+# the native cell has its own parity suite (AI/tests/test-tmuxd-parity.sh).
+export TMUX_PLUGINS_MACHINE_CONFIG="$TS_TMP/plugins.machine"
+: > "$TMUX_PLUGINS_MACHINE_CONFIG"
+# quiet-commit persists through the native `tmuxd preferences` setter, which resolves its
+# server from TMUXD_SOCKET_ARGS (the tmux shim below never rewrites `tmuxd`). Pin it to the
+# isolated server and seed its state store and allowlist, or every write lands on the live
+# server while the assertions read this one (docs/testing.md).
+PERSIST="$TMUX_CONFIG_DIR/AI/tmux-status-persist.sh"
+export TMUXD_BIN="${TMUXD_TEST_BIN:-$TMUX_CONFIG_DIR/modules/tmuxd/target/release/tmuxd}"
+export TMUXD_SOCKET_ARGS="-L $TS_SOCK"
+gtimeout 2m "$TMUXD_BIN" state init
+gtimeout 2m bash "$PERSIST" bootstrap
+tmux set -g @plugin_preference_options "$(bash "$PERSIST" preference-names | tr '\n' ' ')"
 cleanup() {
   if [ -f "$BUCKLE_PIDFILE" ]; then
     pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) || pid=""
@@ -68,24 +88,14 @@ exec "$REAL_TMUX" -L "$TS_SOCK" "\$@"
 SHIM
 chmod +x "$TS_SHIMDIR/tmux"
 
-# Deterministic process-liveness shim: fake launches record their own pid, and pgrep reports the
-# union of live recorded instances. That makes multiple survivors observable.
+# Fake launches record their own pid in BUCKLE_PID_LOG, so multiple survivors stay observable.
 BUCKLE_CACHE_DIR="$TS_TMP/buckle-cache"
 BUCKLE_PIDFILE="$BUCKLE_CACHE_DIR/buckle.pid"
 BUCKLE_LOG="$BUCKLE_CACHE_DIR/buckle.log"
 BUCKLE_PID_LOG="$TS_TMP/buckle.pids"
 export BUCKLE_CACHE_DIR BUCKLE_PIDFILE BUCKLE_LOG BUCKLE_PID_LOG
-cat > "$TS_SHIMDIR/pgrep" <<'SHIM'
-#!/usr/bin/env bash
-found=1
-if [ "${1:-}" = -x ] && [ "${2:-}" = buckle ] && [ -f "$BUCKLE_PID_LOG" ]; then
-  while read -r pid; do
-    if kill -0 "$pid" 2>/dev/null; then printf '%s\n' "$pid"; found=0; fi
-  done < "$BUCKLE_PID_LOG"
-fi
-exit "$found"
-SHIM
-chmod +x "$TS_SHIMDIR/pgrep"
+# The live daemons on this machine, if any: the suite must leave every one of them alive.
+PRODUCTION_BUCKLE_PIDS="$(pgrep -x buckle 2>/dev/null | tr '\n' ' ')"
 
 # Restore runs a fake stale executable from an env-overridden plugin dir. The
 # newer source fixture proves the nobuild path does not invoke display-popup.
@@ -96,7 +106,9 @@ mkdir -p "$FAKE_BUCKLE_DIR"
 mkdir -p "$FAKE_BUCKLE_DIR/wav-klack/Japanese Black" "$FAKE_BUCKLE_DIR/wav-klack/Typewriter"
 cat > "$FAKE_BUCKLE_DIR/buckle" <<'SHIM'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "$BUCKLE_LAUNCH_LOG"
+# mark_running starts this fake as a stand-in for an already-live daemon; that start is
+# not a launch the plugin made, so it must not count as one.
+[ -n "${BUCKLE_FAKE_MARK:-}" ] || printf '%s\n' "$*" >> "$BUCKLE_LAUNCH_LOG"
 printf '%s\n' "$$" >> "$BUCKLE_PID_LOG"
 if [ "${BUCKLE_FAKE_LINGER:-}" = 1 ]; then
   trap 'exit 0' TERM INT
@@ -146,8 +158,12 @@ wait_live_count() { # count
 
 mark_running() {
   clear_running
-  sleep 300 & # sleep: hold — the sleep process IS the fake live instance
+  # The lingering fake IS the live instance, and the pidfile names it: is_running validates
+  # the holder's command line against the executable name, which a bare `sleep` would fail.
+  BUCKLE_FAKE_MARK=1 BUCKLE_FAKE_LINGER=1 "$FAKE_BUCKLE_DIR/buckle" &
   printf '%s\n' "$!" >> "$BUCKLE_PID_LOG"
+  mkdir -p "$BUCKLE_CACHE_DIR"
+  printf '%s\n' "$!" > "$BUCKLE_PIDFILE"
 }
 
 clear_running() {
@@ -397,6 +413,27 @@ test_gain_at_parity() {
   assert_eq "buckle: --gain-at agrees with tmux_quiet_active over the whole table" "" "$bad"
 }
 
+# --- The output backend: renders, and on the device it should -----------------
+# --audio-check opens the real output silently (no click), proves the render callback runs,
+# and that the unit sits on the system default output — the property the whole "headphones
+# on, no clicks" family of bugs violated. Self-skipping without a built binary; rc 2 means the
+# host has no output device at all (a headless box), which is not a defect of the backend.
+test_audio_check() {
+  local out rc=0
+  if [ ! -x "$REAL_BUCKLE_BIN" ]; then
+    skip "buckle --audio-check: no built binary — output backend unverifiable"
+    return 0
+  fi
+  out="$(gtimeout 20s "$REAL_BUCKLE_BIN" --audio-check 2>/dev/null)" || rc=$?
+  if [ "$rc" = 2 ]; then
+    skip "buckle --audio-check: no output device on this host"
+    return 0
+  fi
+  assert_eq "buckle --audio-check: output renders on the system default device" 0 "$rc"
+  assert_contains "buckle --audio-check: verdict names the device" "$out" 'device="'
+  assert_contains "buckle --audio-check: verdict is ok" "$out" " ok"
+}
+
 # --- Restore reconciles persisted intent to process state --------------------
 test_restore_starts_enabled() {
   clear_running
@@ -484,8 +521,7 @@ test_forced_restore_restarts_running() {
 
 test_failed_build_popup_holds_and_preserves_rc() {
   local fail_dir="$TS_TMP/failing build" output rc
-  mkdir -p "$fail_dir/mac/lib/pkgconfig"
-  : > "$fail_dir/mac/lib/pkgconfig/openal.pc"
+  mkdir -p "$fail_dir"
   printf '#!/usr/bin/env bash\nprintf "build failed visibly\\n"\nexit 7\n' > "$TS_SHIMDIR/make"
   chmod +x "$TS_SHIMDIR/make"
   output=$(printf q | bash "$BUCKLE" build-popup "$fail_dir" 2>&1); rc=$?
@@ -505,10 +541,24 @@ test_pidfile_start_stop
 test_profile_switch_replaces_daemon
 test_plugin_round_trip_resumes_intent
 test_gain_at_parity
+test_audio_check
 test_restore_starts_enabled
 test_restore_keeps_disabled_off
 test_restore_stops_disabled_running
 test_restore_is_idempotent_when_running
 test_forced_restore_restarts_running
 test_failed_build_popup_holds_and_preserves_rc
+
+# --- Isolation: this suite never touches the machine's live daemon ------------
+# Twice a sandboxed suite reached bucklespring's reconciler, read no intent from its own
+# server, found the production daemon through a machine-wide `pgrep -x buckle`, and killed it
+# while its own pidfile stayed put (2026-09-25 21:54, 2026-09-26 02:32). Identity is the
+# pidfile now, so the daemons that were alive before this file ran must still be alive.
+test_production_daemon_untouched() {
+  local pid
+  for pid in $PRODUCTION_BUCKLE_PIDS; do
+    assert_rc0 "isolation: live daemon $pid survives the whole suite" kill -0 "$pid"
+  done
+}
+test_production_daemon_untouched
 finish

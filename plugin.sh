@@ -62,8 +62,18 @@ menu_authority() {
   printf '@menu_buckle_pidfile\t%s\n' "$(buckle_absolute_path "$BUCKLE_PIDFILE")"
 }
 
+# The pidfile is the daemon's only handle; the holder must still be a buckle process. Never
+# ask by process name: a name is machine-global, so a sandboxed suite in another cache root
+# would see (and tear down) the production daemon (docs/lessons/daemons/identity.md).
 is_running() {
-  tmux_daemon_is_live "$BUCKLE_PIDFILE" || pgrep -x buckle >/dev/null 2>&1
+  tmux_daemon_is_live "$BUCKLE_PIDFILE" buckle
+}
+
+# Whether the status daemon computes the icon (tmuxd's `bucklespring` producer: the pidfile
+# directory is a path watch and the holder's pid an exit watch, so the cell follows the fact).
+# While it does, this script never writes the cell; it announces the intent options it changed.
+daemon_owns_icon() {
+  [ "$(tmux show -gqv @plugin_tmuxd_bucklespring 2>/dev/null)" = 1 ]
 }
 
 # Whether the last verified start failed the macOS keyboard event-tap permission — a TCC grant
@@ -136,13 +146,9 @@ ensure_binary() {
 }
 
 _build() {                               # directory
-  local dir=$1
-  cd "$dir"
-  if [[ "$(uname)" == "Darwin" && ! -e "$dir/mac/lib/pkgconfig/openal.pc" ]]; then
-    ./setup-macos.sh && make
-  else
-    make
-  fi
+  # One step on every platform: the Mac build links system frameworks only (the
+  # native CoreAudio backend), so there is no dependency setup to run first.
+  cd "$1" && make
 }
 
 build_popup() {                          # internal popup-body arm
@@ -176,10 +182,12 @@ do_start() {
   tmux set -g @buckle_profile "$profile"
   tmux set -g @buckle_enabled 1
   "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
-  # Capture stderr to a log (device opens + default-device re-acquires + errors
-  # are written there) instead of discarding it — so audio-routing behaviour is
-  # observable and verifiable rather than a black box. Truncated each start.
+  # Capture stderr to a log (device opens, device changes, the line naming the exit)
+  # instead of discarding it, so audio routing and every death stay observable. Each start
+  # truncates the log, so the previous life is kept once as buckle.log.1: that is where the
+  # "terminated by SIG…" line of a daemon the status cell just saw die and restarted lives.
   mkdir -p "$BUCKLE_CACHE_DIR"
+  [ ! -f "$BUCKLE_LOG" ] || mv -f "$BUCKLE_LOG" "$BUCKLE_LOG.1"
   # The shared detacher gives the daemon its own session and closes inherited
   # descriptors. Its lifetime therefore cannot depend on whether this action
   # came from tmux, a restore script, an SSH session, or a test runner.
@@ -196,8 +204,8 @@ do_start() {
   tmux_defer 1 "$SELF verify-start"
 }
 
-# Deferred (1s) re-check target for do_start's tmux_defer, called once pgrep has had a beat to
-# see the just-forked process. This is the ONE place that surfaces the tap-permission failure —
+# Deferred (1s) re-check target for do_start's tmux_defer, called once the pidfile holder has
+# had a beat to settle. This is the ONE place that surfaces the tap-permission failure —
 # refresh_icon/icon-refresh stay surfacing-free for their other shared callers (stop/config-load/
 # client-attached/resurrect). Loose "event tap" substring match (not the full message) survives
 # any rewording of scan-mac.m's fprintf. Any other silent launch failure clears the flag too
@@ -220,21 +228,20 @@ do_verify_start() {
 }
 
 do_teardown() {
-  local pid
-  tmux_daemon_stop "$BUCKLE_PIDFILE" || true
-  # Always sweep the declared exact executable. This removes pre-fix wrapper-orphans on profile
-  # switches and first Stop, including when the pidfile existed but named the wrong process.
-  for pid in $(pgrep -x buckle 2>/dev/null || true); do
-    _tmux_daemon_term_wait "$pid" || kill -KILL "$pid" 2>/dev/null || true
-  done
+  # Stop exactly the pidfile holder, and only while its command line still names buckle (a
+  # recycled pid is someone else's). The old exact-name sweep was a footgun: it reached every
+  # buckle on the machine, so a test tearing down its sandboxed copy killed the live daemon.
+  tmux_daemon_stop "$BUCKLE_PIDFILE" "" buckle || true
   tmux set -gu @buckle_perm_error   # deliberate stop always renders red, never orange
-  tmux set -gu @buckle_icon_color
+  daemon_owns_icon || tmux set -gu @buckle_icon_color
 }
 
 do_stop() {
-  do_teardown
+  # Intent first, then the process: the daemon's cell treats "pidfile gone while intent is on"
+  # as a death and brings the process back, so a Stop must withdraw intent before it kills.
   tmux set -g @buckle_enabled 0
   "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
+  do_teardown
 }
 
 do_toggle() {
@@ -308,7 +315,7 @@ do_init() {
   [ -n "$(tmux show -gqv @buckle_enabled 2>/dev/null)" ] || tmux set -g @buckle_enabled 0
   [ -n "$(tmux show -gqv @buckle_profile 2>/dev/null)" ] || tmux set -g @buckle_profile default
   [ -n "$(tmux show -gqv @buckle_gain 2>/dev/null)" ] || tmux set -g @buckle_gain 100
-  tmux set -g @buckle_icon_color ''
+  daemon_owns_icon || tmux set -g @buckle_icon_color ''
   reconcile_intent
 }
 
@@ -317,9 +324,34 @@ do_restore() {
   reconcile_intent
 }
 
+# The cell's value for an observed or forced STATE (1 running, 0 not): green when running;
+# otherwise orange while the last start failed the event-tap permission, red when merely
+# stopped. ONE renderer for the bash writer below and for `plugin.sh icon`, which is the
+# byte-for-byte oracle AI/tests/test-tmuxd-parity.sh holds the daemon's native cell to.
+icon_value() { # [state]
+  local state="${1:-}" off="$TMUX_RED"
+  [ -n "$state" ] || { is_running && state=1 || state=0; }
+  # Running but deaf: the system keeps disabling the tap (scan-mac.m says so once in the log),
+  # so the daemon lives and no key reaches it. The permission colour, not green.
+  if [ "$state" = "1" ] && tap_denied; then state=0; off="$TMUX_ORANGE"; fi
+  [ "$state" = "0" ] && perm_error && off="$TMUX_ORANGE"
+  tmux_render_state_icon "$TMUX_BUCKLE_ICON" "$state" "$TMUX_GREEN" "$off"
+}
+
+# The current life's tap is refused by the system when the denial line is the latest of the
+# three markers in the log tail; a later recovery line or a later start supersedes it. The
+# same three literals, in the same order rule, live in cells/bucklespring.rs.
+tap_denied() {
+  [ -f "$BUCKLE_LOG" ] || return 1
+  tail -c 65536 "$BUCKLE_LOG" 2>/dev/null | awk '
+    /buckle: event tap disabled by the system/ { d = NR }
+    /buckle: event tap receiving events again/ { r = NR }
+    /^buckle: started/ { s = NR }
+    END { exit !(d && d > r && d > s) }'
+}
+
 show_icon() {
-  is_running && local state=1 || local state=0
-  tmux_render_state_icon "$TMUX_BUCKLE_ICON" "$state"
+  icon_value
 }
 
 # Push state into @buckle_icon_color (event-driven status icon). Setting the
@@ -327,20 +359,25 @@ show_icon() {
 # status-interval lag. Mirrors the ESC/Watch icon pattern.
 #
 # Optional arg forces the state: do_start passes 1 for an optimistic green that
-# does NOT wait for pgrep to notice the just-launched process (pgrep lags the
-# fork/exec by a beat — that beat was the start lag). No arg = observe via pgrep
+# does NOT wait for the just-launched holder to settle (the pidfile lands a beat
+# after the fork — that beat was the start lag). No arg = observe the pidfile
 # (used by stop, init, and the client-attached/resurrect re-sync hooks).
 #
-# THE one 3-state renderer: running→green; not running & perm_error→orange (a denied
-# event-tap permission, self-service fixable via the menu's Grant-permission row);
+# THE one 3-state writer (icon_value renders): running→green; not running & perm_error→orange
+# (a denied event-tap permission, self-service fixable via the menu's Grant-permission row);
 # else→red. Every shared caller (stop/config-load/client-attached/resurrect) goes through
-# this one function, so the orange state survives redraws/attaches truthfully.
+# this one function. Once tmuxd's `bucklespring` producer owns the cell (its feature mirror
+# on), the write is the daemon's and this becomes an announce; the bash writer stays for
+# hosts that have not flipped, and is deleted with the last flip.
 refresh_icon() {
-  local state="${1:-}"
-  [ -n "$state" ] || { is_running && state=1 || state=0; }
-  local off="$TMUX_RED"
-  [ "$state" = "0" ] && perm_error && off="$TMUX_ORANGE"
-  tmux set -g @buckle_icon_color "$(tmux_render_state_icon "$TMUX_BUCKLE_ICON" "$state" "$TMUX_GREEN" "$off")"
+  if daemon_owns_icon; then
+    # The daemon renders the fact; tell it the intent options this script may have changed.
+    # A forced optimistic state is meaningless here: the cell goes green when the pidfile's
+    # holder is observed alive, not when a start was attempted.
+    tmux_tmuxd_announce @buckle_enabled @buckle_perm_error
+    return 0
+  fi
+  tmux set -g @buckle_icon_color "$(icon_value "${1:-}")"
 }
 
 # One-click fix affordance for the Grant-permission menu row (open_perms is local to this
@@ -405,10 +442,10 @@ do_doctor() {
     [ -z "$stale" ] && printf 'INFO bucklespring: binary is current\n' \
       || printf 'INFO bucklespring: binary is stale (%s)\n' "$stale"
   else
-    printf 'FAIL bucklespring: binary missing; run setup-macos.sh and make\n'
+    printf 'FAIL bucklespring: binary missing; run make in modules/bucklespring\n'
     rc=1
   fi
-  if tmux_daemon_is_live "$BUCKLE_PIDFILE"; then
+  if tmux_daemon_is_live "$BUCKLE_PIDFILE" buckle; then
     printf 'INFO bucklespring: pidfile holder is live\n'
   elif [ -f "$BUCKLE_PIDFILE" ]; then
     printf 'INFO bucklespring: stale pidfile %s\n' "$BUCKLE_PIDFILE"

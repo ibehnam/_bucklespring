@@ -159,10 +159,35 @@ static const int mactoset1[] =
 static int keystate[128];
 static CFMachPortRef g_tap;
 
+/*
+ * A tap the system keeps disabling is a tap the system is refusing to feed: the
+ * responsible application (the terminal that launched tmux) has lost its
+ * Accessibility or Input Monitoring grant — typically because it was updated on
+ * disk while running, so TCC can no longer validate it. Re-enabling works for
+ * a tick and changes nothing. After TAP_DENIED_TICKS consecutive watchdog
+ * re-enables with no key event between them, say so ONCE in a line the status
+ * cell and `plugin.sh icon` read, keep retrying quietly, and announce recovery
+ * when a key arrives again. Both lines are matched verbatim by
+ * cells/bucklespring.rs and plugin.sh: change them together.
+ */
+#define TAP_DENIED_TICKS 3
+static int g_tap_watchdog_hits;   /* consecutive watchdog re-enables without an event */
+static int g_tap_denied;          /* the denied line has been printed */
+
+static void tap_saw_event(void)
+{
+	g_tap_watchdog_hits = 0;
+	if (g_tap_denied) {
+		g_tap_denied = 0;
+		fprintf(stderr, "buckle: event tap receiving events again\n");
+	}
+}
+
 static void tap_ensure_enabled(const char *why)
 {
 	if (g_tap && !CGEventTapIsEnabled(g_tap)) {
 		CGEventTapEnable(g_tap, true);
+		if (g_tap_denied) return;   /* already said; keep retrying quietly */
 		fprintf(stderr, "buckle: event tap re-enabled (%s)\n", why);
 	}
 }
@@ -171,7 +196,14 @@ static void tap_watchdog(CFRunLoopTimerRef timer, void *info)
 {
 	(void)timer;
 	(void)info;
+	if (!g_tap || CGEventTapIsEnabled(g_tap)) return;
 	tap_ensure_enabled("watchdog");
+	if (++g_tap_watchdog_hits >= TAP_DENIED_TICKS && !g_tap_denied) {
+		g_tap_denied = 1;
+		fprintf(stderr, "buckle: event tap disabled by the system; no keyboard events are delivered. "
+		    "Grant Accessibility/Input Monitoring to the terminal that launched tmux, or restart that "
+		    "terminal if it was updated while running\n");
+	}
 }
 
 CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
@@ -188,6 +220,7 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 	if (type != kCGEventKeyDown && type != kCGEventKeyUp
 	    && type != kCGEventFlagsChanged && (int)type != NX_SYSDEFINED)
 		return event;
+	tap_saw_event();
 
 	/*
 	 * Consumer/media keys (volume, brightness, play/pause, headphone remote)

@@ -106,18 +106,20 @@ See http://snapcraft.io/ for more info about Snap packages
 
 ### MacOS
 
-Since `alure` is no longer available in Homebrew, a setup script is provided to
-build the dependencies locally:
+The Mac build uses CoreAudio directly (`audio-coreaudio.c`) and links system
+frameworks only; there is nothing to install first:
 
 ```
 $ git clone https://github.com/zevv/bucklespring.git && cd bucklespring
-$ ./setup-macos.sh
 $ make
-$ sudo ./buckle
+$ ./buckle
 ```
 
-The setup script will install `openal-soft` and `cmake` via Homebrew, then
-download and build `alure` from source.
+Clicks follow the system default output device for the life of the process
+(AirPods pairing, Control Centre, hot-plug, AirPlay), because the output is a
+DefaultOutput AudioUnit that CoreAudio itself keeps on the default device. Pin a
+device with `-d NAME` instead, list them with `-l`, and run `./buckle --audio-check`
+to prove the output renders on the expected device.
 
 Note that you need superuser privileges to create the event tap on Mac OS X.
 Also give your terminal Accessibility rights: System Preferences -> Security & Privacy -> Privacy -> Accessibility
@@ -142,13 +144,13 @@ usage: ./buckle [options]
 
 options:
 
-  -d DEVICE use OpenAL audio device DEVICE
+  -d DEVICE pin output to audio device DEVICE (default: follow the system default)
   -f        use a fallback sound for unknown keys
   -g GAIN   set playback gain [0..100]
   -m CODE   use CODE as mute key (default 0x46 for scroll lock)
   -M        start the program muted
   -h        show help
-  -l        list available openAL audio devices
+  -l        list available audio output devices
   -p PATH   load .wav files from directory PATH
   -s WIDTH  set stereo width [0..100]
   -v        increase verbosity / debugging
@@ -181,8 +183,9 @@ OpenAL notes
 ------------
 
 
-Bucklespring uses the OpenAL library for mixing samples and providing a
-realistic 3D audio playback. This section contains some tips and tricks for
+On Linux and Windows bucklespring uses the OpenAL library for mixing samples and
+providing a realistic 3D audio playback (macOS uses CoreAudio directly, and none
+of this section applies there). This section contains some tips and tricks for
 properly tuning OpenAL for bucklespring.
 
 * The default OpenAL settings can cause a slight delay in playback. Edit or create
