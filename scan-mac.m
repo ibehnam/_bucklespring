@@ -161,22 +161,23 @@ static CFMachPortRef g_tap;
 
 /*
  * A tap the system will not create, or keeps disabling, is a tap the system is
- * refusing to feed: the responsible process has no Input Monitoring grant. Under
- * launchd that process is buckle itself, and TCC checks a grant against the code
- * signature it was given to; an ad-hoc-signed buckle that `make` rebuilt has a new
- * one, so the old entry stops applying. A tap that cannot be created is said once
- * and retried quietly by the watchdog, with the system's prompt requested once, so
- * a missing grant never becomes a launchd restart loop. A tap the system keeps
- * disabling is the same refusal arriving later: re-enabling works for a tick and
- * changes nothing, so after TAP_DENIED_TICKS consecutive watchdog re-enables with
- * no key event between them, the same prefix is said once. Either way the first
- * key event announces recovery. The prefix and the recovery line are matched
- * verbatim by cells/bucklespring.rs and plugin.sh: change them together.
+ * refusing to feed: the responsible process has no Input Monitoring grant. That
+ * process is the terminal that started the tmux server, which every process the
+ * server starts inherits, so the grant is the terminal's, never buckle's; a
+ * terminal updated on disk while running loses it until it restarts, because TCC
+ * can no longer validate the running copy. A tap that cannot be created is said
+ * once and retried quietly by the watchdog, with the system's prompt requested
+ * once, so the daemon outlives a missing grant and recovers when it lands. A tap
+ * the system keeps disabling is the same refusal arriving later: re-enabling works
+ * for a tick and changes nothing, so after TAP_DENIED_TICKS consecutive watchdog
+ * re-enables with no key event between them, the same prefix is said once. Either
+ * way the first key event announces recovery. The prefix and the recovery line are
+ * matched verbatim by cells/bucklespring.rs: change them together.
  */
 #define TAP_DENIED_TICKS 3
 #define TAP_DENIED_LINE  "buckle: event tap disabled by the system"
-#define TAP_GRANT_HINT   "Grant buckle Input Monitoring in System Settings, Privacy & Security; " \
-                         "after a rebuild, remove buckle there and add it again"
+#define TAP_GRANT_HINT   "Grant Input Monitoring to the terminal that started tmux, in System Settings, " \
+                         "Privacy & Security, or restart that terminal if it was updated while running"
 static int g_tap_watchdog_hits;   /* consecutive watchdog re-enables without an event */
 static int g_tap_denied;          /* the denied line has been printed */
 
@@ -331,11 +332,11 @@ int scan(int verbose)
 {
 	CFRunLoopTimerRef watchdogTimer;
 
-	/* A refused tap is not fatal: exiting would only make launchd restart a process that
-	 * still has no grant. Say so once, request the grant once (that lists buckle under
-	 * Input Monitoring and shows the system prompt), and let the watchdog retry creation
-	 * every tick; the audio watchdog on this run loop keeps running meanwhile. The denied
-	 * state makes the first key event after a late creation announce recovery. */
+	/* A refused tap is not fatal: the grant can land while the daemon lives. Say so once,
+	 * request the grant once (that lists the responsible terminal under Input Monitoring
+	 * and shows the system prompt), and let the watchdog retry creation every tick; the
+	 * audio watchdog on this run loop keeps running meanwhile. The denied state makes the
+	 * first key event after a late creation announce recovery. */
 	if (tap_create() != 0) {
 		g_tap_denied = 1;
 		fprintf(stderr, TAP_DENIED_LINE "; the tap could not be created. " TAP_GRANT_HINT "\n");

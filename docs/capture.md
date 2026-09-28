@@ -2,15 +2,17 @@
 
 ## The keyboard tap
 
-Keyboard capture is a listen-only session tap, which macOS gates on Input Monitoring. Under the
-LaunchAgent the grant belongs to `buckle` itself, never to a terminal. When the tap cannot be
-created, the daemon stays alive rather than exiting into launchd's restart loop: it asks the
-system once to register it (`CGRequestListenEventAccess`), writes one line beginning `event tap
-disabled by the system`, and retries on its five-second watchdog, noting `event tap created`
-once a retry succeeds. A tap the system keeps
-disabling is the same failure arriving later: after three watchdog re-enables with no event
-between them, the daemon writes the same line and keeps retrying quietly, and `event tap
-receiving events again` marks recovery. The status cell reads those lines from the log tail and
+Keyboard capture is a listen-only session tap, which macOS gates on Input Monitoring. TCC checks
+the grant of the responsible process: the terminal that started the tmux server, whose identity
+every process the server starts inherits. The grant is therefore the terminal's, never
+`buckle`'s. When the tap cannot be created, the daemon stays alive, since the grant can land
+while it runs: it asks the system once to register the request (`CGRequestListenEventAccess`,
+which lists the terminal), writes one line beginning `event tap disabled by the system` that
+names the terminal as the application to grant or restart, and retries on its five-second
+watchdog, noting `event tap created` once a retry succeeds. A tap the system keeps disabling is
+the same failure arriving later, typically after the terminal was updated on disk while running:
+after three watchdog re-enables with no event between them, the daemon writes the same line and
+keeps retrying quietly, and `event tap receiving events again` marks recovery. The status cell reads those lines from the log tail and
 paints a live but deaf daemon orange, never green. The tap also re-enables itself when
 WindowServer reports a timeout or user-input disable. This healing lives in the C fork, so the
 loaded sound buffers survive it.

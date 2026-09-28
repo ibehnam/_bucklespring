@@ -2,8 +2,8 @@
 
 # Bucklespring plugin
 
-The `bucklespring` plugin owns key sounds: the `buckle` daemon and, on macOS, its LaunchAgent; the sound preferences and their menu; and the key-sound icon, whose producer it owns in the status daemon.
+The `bucklespring` plugin owns key sounds: the `buckle` daemon; the sound preferences and their menu; and the key-sound icon, whose producer it owns in the status daemon.
 
-- [Lifecycle](docs/bucklespring.md): the pidfile claim, the supervisor, settings delivery, reconciliation, the icon, and signing.
-- [Capture and output](docs/capture.md): the keyboard tap and its permission, the output unit, the heartbeat, and quiet hours.
-- [Lessons](docs/lessons.md): the incidents behind the profile list, the detacher, the backend, identity, and permissions.
+- [Lifecycle](docs/bucklespring.md): the pidfile claim, the detached launch, settings delivery, reconciliation, the icon, and building.
+- [Capture and output](docs/capture.md): the keyboard tap and the terminal's permission, the output unit, the heartbeat, and quiet hours.
+- [Lessons](docs/lessons.md): the incidents behind the profile list, the detacher, the backend, identity, permissions, and the retired LaunchAgent.

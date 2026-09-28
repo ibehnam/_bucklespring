@@ -5,11 +5,12 @@
 # The daemon owns its identity, its log, and its settings: it claims its pidfile
 # under an exclusive lock, rotates its own log, and rereads the settings file
 # this script writes whenever it receives SIGHUP, so a gain, quiet-hours, or
-# profile change never restarts it. On macOS it is a LaunchAgent, which launchd
-# restarts after a crash and starts at login while intent is on; on Linux this
-# script launches it detached, and the reconciler that init, attach, and restore
-# share restarts it. The status icon is the status daemon's `bucklespring`
-# producer; this script never writes it.
+# profile change never restarts it. This script launches it detached on every
+# platform, and the reconciler that init, attach, and restore share restarts it.
+# On macOS a process the tmux server starts borrows the keyboard grant of the
+# terminal that started the server, its responsible process, so buckle needs no
+# grant, signature, or supervisor of its own (docs/lessons.md). The status icon
+# is the status daemon's `bucklespring` producer; this script never writes it.
 
 set -euo pipefail
 
@@ -27,17 +28,6 @@ BUCKLE_CACHE_DIR="${BUCKLE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tmux-buckl
 BUCKLE_LOG="${BUCKLE_LOG:-$BUCKLE_CACHE_DIR/buckle.log}"
 BUCKLE_PIDFILE="${BUCKLE_PIDFILE:-$BUCKLE_CACHE_DIR/buckle.pid}"
 BUCKLE_SETTINGS="${BUCKLE_SETTINGS:-$BUCKLE_CACHE_DIR/settings}"
-# The platform decides the supervisor; the suite forces either branch.
-BUCKLE_OS="${BUCKLE_OS:-$(uname -s)}"
-# The LaunchAgent. The manifest's `durable` row names the same plist, so purge
-# removes exactly the file this script renders.
-BUCKLE_LABEL=com.behnam.bucklespring
-BUCKLE_AGENTS_DIR="${BUCKLE_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
-BUCKLE_PLIST="$BUCKLE_AGENTS_DIR/$BUCKLE_LABEL.plist"
-BUCKLE_TEMPLATE="$SCRIPT_DIR/launchd/$BUCKLE_LABEL.plist.in"
-BUCKLE_LAUNCHCTL="${BUCKLE_LAUNCHCTL:-launchctl}"
-# The host's local code-signing identity (`sign-identity` creates it once).
-BUCKLE_SIGN_NAME="${BUCKLE_SIGN_NAME:-Bucklespring Local Signing}"
 
 # The profile enumeration is shared by the shell menu, action validator, and
 # compiled native-menu authority.  A profile name is a directory component,
@@ -156,64 +146,7 @@ apply_settings() {
 }
 
 # ---------------------------------------------------------------------------
-# Supervision. macOS: launchd, through one function the suite fakes. Only the
-# checkout the running server loaded manages the LaunchAgent, because it is
-# machine-global: a suite's isolated server or a second checkout must never
-# bootstrap, replace, or unload the live one.
-
-darwin() { [ "$BUCKLE_OS" = Darwin ]; }
-
-owns_launchd() {
-  darwin && tmux_server_runs_checkout "$TMUX_CONFIG_DIR"
-}
-
-_launchd() { # print|bootstrap|bootout|kickstart|enable|disable
-  local domain="gui/$UID"
-  case "$1" in
-    print)     "$BUCKLE_LAUNCHCTL" print "$domain/$BUCKLE_LABEL" ;;
-    bootstrap) "$BUCKLE_LAUNCHCTL" bootstrap "$domain" "$BUCKLE_PLIST" ;;
-    bootout)   "$BUCKLE_LAUNCHCTL" bootout "$domain/$BUCKLE_LABEL" ;;
-    kickstart) "$BUCKLE_LAUNCHCTL" kickstart -k "$domain/$BUCKLE_LABEL" ;;
-    enable)    "$BUCKLE_LAUNCHCTL" enable "$domain/$BUCKLE_LABEL" ;;
-    disable)   "$BUCKLE_LAUNCHCTL" disable "$domain/$BUCKLE_LABEL" ;;
-    *) return 2 ;;
-  esac
-}
-
-agent_loaded() { _launchd print >/dev/null 2>&1; }
-
-xml_escape() { # text
-  local s="$1"
-  s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; s=${s//\"/&quot;}
-  printf '%s' "$s"
-}
-
-# The plist this checkout wants, from the template: every path is absolute, and
-# the settings file carries everything that changes, so the plist changes only
-# when a path does.
-render_plist() {
-  local t
-  t=$(cat "$BUCKLE_TEMPLATE") || return 1
-  # Bash 5.2 expands `&` in a substitution's replacement; the escapes carry one.
-  shopt -u patsub_replacement 2>/dev/null || true
-  t=${t//@LABEL@/$BUCKLE_LABEL}
-  t=${t//@BUCKLE@/$(xml_escape "$(buckle_absolute_path "$BUCKLE_DIR")/buckle")}
-  t=${t//@DIR@/$(xml_escape "$(buckle_absolute_path "$BUCKLE_DIR")")}
-  t=${t//@LOG@/$(xml_escape "$(buckle_absolute_path "$BUCKLE_LOG")")}
-  t=${t//@PIDFILE@/$(xml_escape "$(buckle_absolute_path "$BUCKLE_PIDFILE")")}
-  t=${t//@SETTINGS@/$(xml_escape "$(buckle_absolute_path "$BUCKLE_SETTINGS")")}
-  printf '%s\n' "$t"
-}
-
-# Install the plist, compare-first: rc 0 when it changed, 1 when it was current.
-install_plist() {
-  local want have=""
-  want=$(render_plist) || return 2
-  [ ! -f "$BUCKLE_PLIST" ] || have=$(cat "$BUCKLE_PLIST" 2>/dev/null) || true
-  [ "$have" = "$want" ] && return 1
-  mkdir -p "$BUCKLE_AGENTS_DIR"
-  printf '%s\n' "$want" | tmux_atomic_write "$BUCKLE_PLIST"
-}
+# Launch and stop.
 
 # Wait up to a second for the daemon's own claim: the pidfile names a live buckle.
 wait_live() {
@@ -226,68 +159,43 @@ wait_live() {
   return 1
 }
 
-# Start the daemon under its platform's supervisor. The caller has written the settings;
-# a binary older than its sources is never handed to a supervisor (ensure_binary says why).
+# Start the daemon detached: its own session, no inherited descriptors, and a
+# lifetime independent of the caller. The caller has written the settings; a
+# binary older than its sources is never launched (ensure_binary says why). The
+# daemon rotates and opens its own log as its first argument; the detacher's
+# output would truncate the previous life's log before it could.
 launch() {
   binary_current || return 1
   mkdir -p "$BUCKLE_CACHE_DIR"
-  if darwin; then
-    owns_launchd || { printf 'bucklespring: launchd belongs to the server that loaded %s\n' "$TMUX_CONFIG_DIR" >&2; return 1; }
-    # A holder launchd does not know is a legacy launch (or a hand-started one):
-    # it would keep the lock the agent's daemon needs.
-    agent_loaded || tmux_daemon_stop "$BUCKLE_PIDFILE" "" buckle || true
-    local rc=0
-    install_plist || rc=$?
-    [ "$rc" = 2 ] && return 1
-    _launchd enable >/dev/null 2>&1 || true
-    if agent_loaded; then
-      # A changed plist reaches launchd only through a fresh bootstrap.
-      if [ "$rc" = 0 ]; then
-        _launchd bootout >/dev/null 2>&1 || true
-        _launchd bootstrap || return 1
-      else
-        _launchd kickstart || return 1
-      fi
-    else
-      _launchd bootstrap || return 1
-    fi
-  else
-    # The daemon rotates and opens its own log as its first argument; the
-    # detacher's output would truncate the previous life's log before it could.
-    tmux_tmuxd_detach "$BUCKLE_DIR" /dev/null ./buckle \
-      --log "$BUCKLE_LOG" --pidfile "$BUCKLE_PIDFILE" --settings "$BUCKLE_SETTINGS" >/dev/null || return 1
-  fi
+  tmux_tmuxd_detach "$BUCKLE_DIR" /dev/null ./buckle \
+    --log "$BUCKLE_LOG" --pidfile "$BUCKLE_PIDFILE" --settings "$BUCKLE_SETTINGS" >/dev/null || return 1
   wait_live || printf 'bucklespring: no live holder a second after launch; see %s\n' "$BUCKLE_LOG" >&2
   return 0
 }
 
-# Stop the daemon and keep it stopped. On macOS a disabled agent also stays down
-# at the next login; a holder launchd never knew is stopped by its pidfile.
 stop_daemon() {
-  if owns_launchd; then
-    _launchd bootout >/dev/null 2>&1 || true
-    _launchd disable >/dev/null 2>&1 || true
-  fi
   tmux_daemon_stop "$BUCKLE_PIDFILE" "" buckle || true
 }
 
-# New code for a live daemon: the binary is newer than the holder's claim.
-holder_is_stale() {
-  [ "$BUCKLE_DIR/buckle" -nt "$BUCKLE_PIDFILE" ]
+# A live holder to replace: the binary is newer than its claim (new code), or the
+# claim is older than this server. A detached daemon outlives the server that
+# started it, and its keyboard grant stays attributed to that server's terminal,
+# which a terminal restart leaves dead; a relaunch inherits this server's. The
+# claim is the pidfile's mtime, the generation rule every pane-id cache obeys.
+holder_outdated() {
+  [ "$BUCKLE_DIR/buckle" -nt "$BUCKLE_PIDFILE" ] && return 0
+  local start
+  start=$(tmux display -p '#{start_time}' 2>/dev/null) || return 1
+  [ -n "$start" ] && [ "$(tmux_get_mtime "$BUCKLE_PIDFILE")" -lt "$start" ] 2>/dev/null
 }
 
 relaunch() {
-  if owns_launchd && agent_loaded; then
-    _launchd kickstart >/dev/null 2>&1 || true
-    wait_live || true
-  else
-    tmux_daemon_stop "$BUCKLE_PIDFILE" "" buckle || true
-    launch || true
-  fi
+  stop_daemon
+  launch || true
 }
 
 # ---------------------------------------------------------------------------
-# Building and signing.
+# Building.
 
 # Current when the binary exists and no source is newer than it. This makes a
 # committed source/submodule change actually reach the running process — the
@@ -300,10 +208,9 @@ binary_current() {
   [[ -z "$stale" ]]
 }
 
-# Only a current binary is launched: the daemon's argv contract moves with its
-# sources, and a binary that refuses it would, under launchd, restart every five
-# seconds. An interactive caller builds in a popup; an unattended one (init,
-# attach, restore) never opens one and builds quietly into the build log.
+# Only a current binary is launched, because the daemon's argv contract moves
+# with its sources. An interactive caller builds in a popup; an unattended one
+# (init, attach, restore) never opens one and builds quietly into the build log.
 ensure_binary() { # [quiet]
   binary_current && return 0
   if [ "${1:-}" = quiet ]; then
@@ -320,29 +227,10 @@ ensure_binary() { # [quiet]
   return 1
 }
 
-sign_identity_exists() {
-  security find-identity -v -p codesigning 2>/dev/null | rg -Fq "\"$BUCKLE_SIGN_NAME\""
-}
-
-# Sign with the host's local identity when it exists: the Input Monitoring grant
-# is keyed on the signature, and an ad-hoc one changes with every rebuild. A copy
-# is signed and renamed into place, so a running daemon's executable is untouched.
-sign_binary() { # directory
-  darwin || return 0
-  sign_identity_exists || return 0
-  local bin="$1/buckle" tmp="$1/buckle.signing.$$"
-  if cp -p "$bin" "$tmp" && codesign -f -s "$BUCKLE_SIGN_NAME" --identifier "$BUCKLE_LABEL" "$tmp" \
-      && mv -f "$tmp" "$bin"; then
-    return 0
-  fi
-  rm -f "$tmp"
-  return 1
-}
-
 _build() {                               # directory
   # The Mac build links system frameworks only (the native CoreAudio backend),
   # so there is no dependency setup to run first.
-  (cd "$1" && make) && sign_binary "$1"
+  (cd "$1" && make)
 }
 
 build_popup() {                          # internal popup-body arm
@@ -351,42 +239,6 @@ build_popup() {                          # internal popup-body arm
   printf '\npress any key to close\n'
   IFS= read -rsn1 _ || true
   exit "$rc"
-}
-
-# Create this host's self-signed code-signing identity in the login keychain, once.
-# Interactive by nature: trusting a certificate asks for an administrator, and
-# codesign may ask once for the key (choose Always Allow). Rebuilds then keep the
-# Input Monitoring grant.
-do_sign_identity() {
-  darwin || { printf 'bucklespring: signing identities are a macOS concern\n' >&2; return 2; }
-  if sign_identity_exists; then
-    printf 'bucklespring: "%s" already exists\n' "$BUCKLE_SIGN_NAME"
-    return 0
-  fi
-  local dir keychain rc=0
-  keychain=$(security default-keychain -d user 2>/dev/null | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//') || keychain=""
-  [ -n "$keychain" ] || { printf 'bucklespring: no default keychain\n' >&2; return 1; }
-  dir=$(mktemp -d) || return 1
-  printf '%s\n' '[req]' 'distinguished_name = dn' 'x509_extensions = ext' 'prompt = no' \
-    '[dn]' "CN = $BUCKLE_SIGN_NAME" \
-    '[ext]' 'basicConstraints = critical,CA:FALSE' 'keyUsage = critical,digitalSignature' \
-    'extendedKeyUsage = critical,codeSigning' > "$dir/req.cnf"
-  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$dir/req.cnf" \
-      -keyout "$dir/key.pem" -out "$dir/cert.pem" >/dev/null 2>&1 \
-    && security import "$dir/key.pem" -k "$keychain" -T /usr/bin/codesign \
-    && security import "$dir/cert.pem" -k "$keychain" \
-    && security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$dir/cert.pem" \
-    || rc=$?
-  rm -rf "$dir"
-  if [ "$rc" != 0 ]; then
-    printf 'bucklespring: creating the signing identity failed (rc %s)\n' "$rc" >&2
-    return "$rc"
-  fi
-  # The key's partition list lets codesign use it without a prompt; it needs the
-  # keychain password, so a refusal here only means one prompt at the first build.
-  security set-key-partition-list -S apple-tool:,apple: -s -D "$BUCKLE_SIGN_NAME" "$keychain" >/dev/null 2>&1 \
-    || printf 'bucklespring: codesign may ask once for keychain access; choose Always Allow\n'
-  printf 'bucklespring: created "%s"; the next build signs with it\n' "$BUCKLE_SIGN_NAME"
 }
 
 # ---------------------------------------------------------------------------
@@ -409,9 +261,9 @@ do_start() {
   tmux set -g @buckle_enabled 1
   "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
   write_settings || true
-  # A live daemon takes the new profile at its next click; a rebuild restarts it.
+  # A live daemon takes the new profile at its next click; an outdated one restarts.
   if is_running; then
-    if holder_is_stale; then relaunch; else signal_holder; fi
+    if holder_outdated; then relaunch; else signal_holder; fi
   else
     launch || true
   fi
@@ -474,21 +326,19 @@ reconcile_intent() {
   write_settings && changed=1
   if [ "$enabled" = 1 ]; then
     # New sources are built before anything is decided, so a daemon they outdate
-    # is relaunched below; a build that fails leaves a live daemon alone.
+    # is relaunched below, as is one another server started; a build that fails
+    # leaves a live daemon alone.
     ensure_binary quiet || true
     if ! is_running; then
       launch || true
-    elif holder_is_stale && binary_current; then
+    elif holder_outdated && binary_current; then
       relaunch
-    elif owns_launchd && ! agent_loaded; then
-      # A daemon from before the LaunchAgent: hand it to launchd.
-      launch || true
     elif [ "$changed" = 1 ]; then
       signal_holder
     fi
-  elif is_running || { owns_launchd && agent_loaded; }; then
-    # Off, yet a daemon runs: a login started an agent that was never disabled,
-    # or a restore brought back a server whose intent says off.
+  elif is_running; then
+    # Off, yet a daemon runs: it outlived the server that started it, or a
+    # restore brought back a server whose intent says off.
     stop_daemon
   fi
   refresh_icon
@@ -507,11 +357,6 @@ do_init() {
   reconcile_intent
 }
 
-# Purge removes the plist (a `durable` row); unload the agent before the file goes.
-do_purge() {
-  stop_daemon
-}
-
 # The daemon's cell is the one judge of a refused keyboard tap; the menu and the
 # doctor read its published verdict instead of parsing the log a second time.
 denied_published() {
@@ -520,8 +365,8 @@ denied_published() {
   [ -n "$published" ] && [ "$published" = "${TMUX_ORANGE}${TMUX_BUCKLE_ICON}${TMUX_RESET}" ]
 }
 
-# One-click fix affordance for the permission menu row: under launchd the grant
-# belongs to buckle itself, in Input Monitoring.
+# One-click fix affordance for the permission menu row: the grant belongs to the
+# terminal that started the tmux server, in Input Monitoring.
 open_perms() {
   open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
 }
@@ -589,26 +434,12 @@ do_doctor() {
   elif [ -f "$BUCKLE_PIDFILE" ]; then
     printf 'INFO bucklespring: stale pidfile %s\n' "$BUCKLE_PIDFILE"
   fi
-  if darwin; then
-    if [ ! -f "$BUCKLE_PLIST" ]; then
-      printf 'INFO bucklespring: no LaunchAgent at %s\n' "$BUCKLE_PLIST"
-    elif agent_loaded; then
-      printf 'INFO bucklespring: LaunchAgent %s is loaded\n' "$BUCKLE_LABEL"
-    else
-      printf 'INFO bucklespring: LaunchAgent %s is not loaded\n' "$BUCKLE_LABEL"
-    fi
-    if sign_identity_exists; then
-      printf 'INFO bucklespring: signing identity "%s" exists\n' "$BUCKLE_SIGN_NAME"
-    else
-      printf 'INFO bucklespring: no signing identity; every rebuild asks for Input Monitoring again (run plugin.sh sign-identity once)\n'
-    fi
-  fi
   if [ -f "$BUCKLE_CACHE_DIR/render.hb" ]; then
     age=$(( $(date +%s) - $(tmux_get_mtime "$BUCKLE_CACHE_DIR/render.hb") ))
     printf 'INFO bucklespring: audio heartbeat %ss old\n' "$age"
   fi
   if denied_published; then
-    printf 'FAIL bucklespring: the keyboard tap is refused; grant buckle Input Monitoring (the menu opens the pane)\n'
+    printf 'FAIL bucklespring: the keyboard tap is refused; grant Input Monitoring to the terminal that started tmux (the menu opens the pane), or restart that terminal if it was updated while running\n'
     rc=1
   fi
   if [ -f "$BUCKLE_LOG" ]; then
@@ -621,9 +452,9 @@ do_doctor() {
 case "${1:-}" in
   init)          do_init ;;
   teardown)      do_teardown ;;
-  purge)         do_purge ;;          # the declared cache and plist removal is core-owned
+  purge)         : ;;                 # core's teardown stops the daemon; cache removal is core-owned
   doctor)        do_doctor ;;
-  attach)        reconcile_intent ;;  # Linux has no supervisor: attach restarts a dead daemon
+  attach)        reconcile_intent ;;  # attach restarts a dead daemon
   menu)          if [ "${2:-}" = - ]; then show_menu "${3:-}"; else show_menu "${2:-}"; fi ;;
   start)         do_start "${2:-default}" ;;
   stop)          do_stop ;;
@@ -636,6 +467,5 @@ case "${1:-}" in
   icon-refresh)  refresh_icon ;;
   open-perms)    open_perms ;;
   build-popup)   build_popup "${2:?missing build directory}" ;;
-  sign-identity) do_sign_identity ;;
-  *)             printf 'Usage: plugin.sh init|teardown|purge|doctor|attach|menu|start|stop|toggle|gain|quiet-commit|menu-authority|profile-valid|restore|icon-refresh|open-perms|sign-identity\n'; exit 1 ;;
+  *)             printf 'Usage: plugin.sh init|teardown|purge|doctor|attach|menu|start|stop|toggle|gain|quiet-commit|menu-authority|profile-valid|restore|icon-refresh|open-perms\n'; exit 1 ;;
 esac

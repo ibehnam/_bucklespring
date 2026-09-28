@@ -76,8 +76,17 @@ only restarting the terminal, then the tmux server under it, does. What the repo
 tell the truth: the daemon names the state once in its log, the cell reads it and paints orange,
 and the line says which application to restart.
 
-The LaunchAgent is the resolution. A process launchd starts is its own responsible process, so
-buckle's Input Monitoring grant is its own, and no terminal update can revoke it. The grant is
-keyed on the binary's signature, and an ad-hoc signature changes with every build; that is why
-`plugin.sh sign-identity` gives each host one self-signed identity, and why the daemon asks the
-system to list it and keeps retrying rather than exiting into launchd's restart loop.
+## A LaunchAgent traded a rare failure for permanent costs
+
+For one day (2026-09-27 to 2026-09-28) buckle ran as a LaunchAgent, its own responsible process,
+so that no terminal update could revoke its grant. The price was a second grant, keyed on
+buckle's code signature, which the linker's ad-hoc signature changes at every build; each rebuild
+asked for Input Monitoring again. Keeping it required a self-signed identity in every host's
+login keychain, a signing step, and a machine-global job that only the checkout the running
+server loaded could manage. None of it bought anything the terminal's grant did not already give.
+
+The daemon again launches detached from the tmux server and borrows the terminal's grant. The
+in-place update above remains a failure the repository reports rather than prevents. Restarting
+the terminal, then tmux, repairs it: the new server relaunches the deaf survivor, whose claim
+predates it. The rule: prefer the grant the user already gave; a rare failure the icon names
+costs less than a second identity on every host.

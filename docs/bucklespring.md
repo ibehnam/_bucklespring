@@ -1,6 +1,6 @@
 # Bucklespring lifecycle
 
-The plugin controller (`plugin.sh`) owns start and stop, profile, gain, quiet hours, permission guidance, building, and signing. Profiles are discovered from sound directories.
+The plugin controller (`plugin.sh`) owns start and stop, profile, gain, quiet hours, permission guidance, and building. Profiles are discovered from sound directories.
 
 ## Profiles and menus
 
@@ -21,17 +21,15 @@ rotates `buckle.log` to `buckle.log.1`, so the line naming the previous exit sur
 that follows and a refused second daemon, which reports on the stderr it inherited, never moves
 the holder's log aside. Every exit leaves a line naming the signal or the ended run loop.
 
-## Supervision
+## Launch
 
-On macOS the daemon is a LaunchAgent, `com.behnam.bucklespring`, rendered from
-`launchd/com.behnam.bucklespring.plist.in` into `~/Library/LaunchAgents`. `KeepAlive` restarts a
-crash and never a clean exit, `ThrottleInterval` spaces restarts five seconds apart, and
-`RunAtLoad` starts it at login while it is enabled. Start enables and bootstraps it, or kickstarts
-a loaded one; Stop, teardown, and purge boot it out and disable it, so it also stays down at the
-next login. Purge then removes the plist, a `durable` manifest row. The agent is machine-global,
-so only the checkout the running server loaded may manage it (`tmux_server_runs_checkout`): a
-suite's isolated server or a second checkout never reaches `launchctl`. On Linux the script
-launches the daemon through the shared detacher, in its own session and process group.
+The script launches the daemon through the shared detacher (`tmux_tmuxd_detach`) on every
+platform: its own session and process group, no inherited descriptors, and a lifetime that never
+depends on whether the start came from a menu, a restore, an SSH session, or a test runner. On
+macOS the tmux server is that launch's ancestor, so the daemon's responsible process is the
+terminal that started the server, and that terminal's Input Monitoring grant covers the keyboard
+tap. `buckle` holds no grant, signature, or LaunchAgent of its own ([capture](capture.md),
+[lessons](lessons.md)).
 
 ## Settings
 
@@ -45,13 +43,15 @@ is derived from the shared level set in the shell, so only the time comparison e
 
 `init`, `attach`, and `restore` share one reconciler, and the native menu reaches it through
 core's forced apply. It rewrites the settings. With intent on, it launches a stopped daemon,
-relaunches one whose binary is newer than its claim, hands a daemon launchd never loaded over to
-the agent, and otherwise signals a changed setting. With intent off, it stops a daemon that still
-runs. Linux has no supervisor, so the reconciler at attach is what restarts a dead daemon there.
+relaunches one whose binary is newer than its claim or whose claim is older than the running
+server, and otherwise signals a changed setting. The second rule exists because a detached
+daemon outlives its server while its grant stays with that server's terminal: after the terminal
+and tmux restart, the new server's reconciler replaces the deaf survivor.
+With intent off, it stops a daemon that still runs. No supervisor watches the process, so the
+reconciler at attach is what restarts a dead daemon; the icon turns red the moment one dies.
 Unattended paths never open a build popup: they rebuild a binary older than its sources quietly
 into `build.log`. Every launch requires a current binary, because the daemon's argv contract
-moves with its sources, and a binary that refused it would restart under launchd every five
-seconds.
+moves with its sources.
 
 ## Icon
 
@@ -64,13 +64,9 @@ dies. The menu's Input Monitoring row and the doctor read the published icon rat
 the log a second time. `modules/tmuxd/src/cells/bucklespring.rs` holds the rules, and
 `AI/tests/test-tmuxd-parity.sh` pins them against goldens.
 
-## Building and signing
+## Building
 
 The Mac build is `make` alone: system frameworks, no Homebrew packages, no generated pkg-config
-files. Rebuild when sources are newer than the binary, not only when the executable is missing.
-Under launchd the Input Monitoring grant belongs to `buckle` itself and is keyed on its
-signature, and an ad-hoc signature changes with every build, so each rebuild would ask again.
-`plugin.sh sign-identity` creates a self-signed code-signing identity in the login keychain once
-per host; trusting it asks for an administrator, and codesign may ask once for the key. `_build`
-then signs a copy with it and renames the copy into place, so a running daemon's executable is
-untouched. Without the identity the doctor says that rebuilds prompt again.
+files, and no signature beyond the linker's ad-hoc one, because the grant belongs to the
+terminal and a rebuild therefore never asks for it again. Rebuild when sources are newer than the
+binary, not only when the executable is missing.

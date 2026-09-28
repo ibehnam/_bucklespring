@@ -227,9 +227,8 @@ static void say(const char *fmt, ...)
 /*
  * --log PATH: this life's stderr, opened only once the pidfile is claimed, so an instance
  * that is refused never moves the holder's log. The previous life's file is kept once as
- * PATH.1; under launchd that file also holds whatever the process printed before this point,
- * because the job's StandardErrorPath names the same file. Only a regular file is moved
- * aside. A log that will not open leaves the inherited stderr in place.
+ * PATH.1. Only a regular file is moved aside. A log that will not open leaves the inherited
+ * stderr in place.
  */
 static void log_to(const char *path)
 {
@@ -264,13 +263,11 @@ static void log_to(const char *path)
 /*
  * --pidfile PATH: the daemon's identity, claimed before the life starts. An exclusive
  * flock, held for the life of the process, lets one buckle own a pidfile at a time; any
- * other exits EX_TEMPFAIL (75), which launchd's KeepAlive retries after its throttle
- * interval. The lock lives on the inode that was opened, so a path unlinked or replaced
- * between the open and the lock (a holder removing it on its way out) is opened again.
- * Only the holder removes the file, and only while the path still names its inode. A failed
- * claim writes its one line straight to the inherited stderr, since --log opens only after
- * the claim; under launchd that is the job's StandardErrorPath, the holder's own log opened
- * for append, so the line lands there and nothing is moved.
+ * other exits EX_TEMPFAIL (75). The lock lives on the inode that was opened, so a path
+ * unlinked or replaced between the open and the lock (a holder removing it on its way out)
+ * is opened again. Only the holder removes the file, and only while the path still names
+ * its inode. A failed claim writes its one line straight to the inherited stderr, since
+ * --log opens only after the claim, so nothing of the holder's is moved.
  */
 #define CLAIM_ATTEMPTS 5
 
@@ -346,7 +343,7 @@ static int pidfile_claim(const char *path)
 
 /*
  * Signals. This daemon has died silently more than once while its status icon stayed
- * green, so TERM (a Stop, launchd, a stray kill) and INT end the life with a line naming
+ * green, so TERM (a Stop, a teardown, a stray kill) and INT end the life with a line naming
  * them, and remove the pidfile they hold. KILL and a crash stay silent, and a crash writes
  * its own report. HUP no longer ends anything: it asks for the settings file again, which
  * play() rereads at the next key event. The handlers use only async-signal-safe calls.
@@ -693,7 +690,8 @@ int main(int argc, char **argv)
 
 	/* Open the output. Without -d the backend follows the system default output
 	 * for the life of the process; with -d it stays on the named device. Either
-	 * failure below is the daemon's own: the pidfile goes, and launchd restarts it. */
+	 * failure below is the daemon's own: the pidfile goes, the icon turns red, and the
+	 * plugin's reconciler starts a new life at the next attach. */
 
 	if (audio_open(opt_device) != 0) {
 		pidfile_release();

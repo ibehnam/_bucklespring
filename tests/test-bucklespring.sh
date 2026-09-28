@@ -3,9 +3,9 @@
 #
 # Menu coverage asserts every actionable archetype (profile radio, volume radio, Running
 # toggle) receives the constructor-derived sticky reopen. Lifecycle coverage proves the
-# daemon's own pidfile claim, settings delivered by SIGHUP instead of a relaunch, init/restore
-# reconciliation without a build popup, and the macOS LaunchAgent verbs through a recording
-# `launchctl`.
+# daemon's own pidfile claim, settings delivered by SIGHUP instead of a relaunch, the
+# detached launch every platform shares, and init/restore reconciliation without a build
+# popup.
 #
 # SEAM: plugin.sh's CLI case has no source-guard (sourcing it would run the case),
 # so we run `menu` as a SUBPROCESS behind a display-menu-capturing `tmux` shim (mirrors
@@ -14,9 +14,6 @@
 # (BUCKLE_PIDFILE under its own cache root) and a fake buckle; nothing real is launched or
 # built. There is deliberately no `pgrep` shim: identity is the pidfile, so the production
 # daemon on this machine is invisible here by construction, and the suite proves that.
-# BUCKLE_OS=Linux keeps every ordinary case on the detached launch; the LaunchAgent cases
-# force Darwin, a fake `launchctl`, and a server that loaded a scratch checkout, because only
-# that server may manage the machine-global agent.
 #
 # LANE: integration
 # BUDGET: 30
@@ -34,7 +31,6 @@ REAL_BUCKLE_BIN="$HERE/../buckle"
 tsetup
 export XDG_CACHE_HOME="$TS_TMP/cache"
 export XDG_STATE_HOME="$TS_TMP/state"
-export BUCKLE_OS=Linux
 # The committed defaults, not this machine's overlay: every compile here re-reads the
 # plugin layers (docs/testing.md).
 export TMUX_PLUGINS_MACHINE_CONFIG="$TS_TMP/plugins.machine"
@@ -49,7 +45,6 @@ export TMUXD_SOCKET_ARGS="-L $TS_SOCK"
 gtimeout 2m "$TMUXD_BIN" state init
 gtimeout 2m bash "$PERSIST" bootstrap
 tmux set -g @plugin_preference_options "$(bash "$PERSIST" preference-names | tr '\n' ' ')"
-CFG_SOCK="$TS_SOCK-cfg"
 cleanup() {
   if [ -f "$BUCKLE_PIDFILE" ]; then
     pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) || pid=""
@@ -58,7 +53,6 @@ cleanup() {
   if [ -f "${BUCKLE_PID_LOG:-}" ]; then
     while read -r pid; do kill -KILL "$pid" 2>/dev/null || true; done < "$BUCKLE_PID_LOG"
   fi
-  "$REAL_TMUX" -L "$CFG_SOCK" kill-server 2>/dev/null
   tteardown
 }
 trap cleanup EXIT
@@ -499,8 +493,8 @@ test_claim_is_exclusive() {
   pid=$!
   assert_rc0 "buckle claim: the holder writes its pid" wait_file_contains "$dir/buckle.pid" "$pid"
   assert_rc0 "buckle claim: and starts its own log" wait_file_contains "$dir/buckle.log" "buckle: started, pid $pid"
-  # A refused daemon touches nothing: it says so on the stderr it inherited (under launchd,
-  # the holder's log, opened for append) and never rotates the holder's log aside.
+  # A refused daemon touches nothing: it says so on the stderr it inherited and never
+  # rotates the holder's log aside.
   gtimeout 10s "$REAL_BUCKLE_BIN" --log "$dir/buckle.log" --pidfile "$dir/buckle.pid" --claim-only \
     2>"$dir/second.err" || rc=$?
   assert_eq "buckle claim: a second daemon exits 75" 75 "$rc"
@@ -622,9 +616,26 @@ test_forced_restore_restarts_only_new_code() {
   tmux set -g @buckle_gain 100
 }
 
+# A detached daemon outlives the server that started it, and its keyboard grant stays with
+# that server's terminal. A claim older than this server is relaunched once, and the new
+# claim settles it. The stamp sits between the fake binary's (2020) and the server's start,
+# so only the server rule can fire.
+test_restore_relaunches_a_previous_servers_holder() {
+  rm -f "$BUCKLE_LAUNCH_LOG"
+  mark_running
+  tmux set -g @buckle_enabled 1
+  touch -t 202101010000 "$BUCKLE_PIDFILE"
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" restore
+  assert_rc0 "buckle restore: another server's holder settles at one daemon" wait_live_count 1
+  assert_eq "buckle restore: and is relaunched once" "1" "$(launch_count)"
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" restore
+  assert_eq "buckle restore: this server's own holder is left alone" "1" "$(launch_count)"
+  clear_running
+}
+
 # An unattended reconcile never opens a popup and never launches a binary older than its
-# sources: the daemon's argv contract moves with them, and under launchd a binary that
-# refused it would restart every five seconds. The build runs quietly into its log.
+# sources, because the daemon's argv contract moves with them. The build runs quietly into
+# its log.
 test_unattended_build_is_quiet() {
   local err="$TS_TMP/restore.err"
   clear_running
@@ -665,112 +676,6 @@ test_failed_build_popup_holds_and_preserves_rc() {
   rm -f "$TS_SHIMDIR/make"
 }
 
-# --- The LaunchAgent ------------------------------------------------------------
-# macOS supervises the daemon with launchd. The agent is machine-global, so only the server
-# that loaded this checkout may manage it: a scratch checkout with an empty tmux.conf, a
-# second isolated server started from it, a scratch HOME for the plist, and a recording
-# `launchctl` whose bootstrap and kickstart start the fake daemon and whose bootout stops it.
-test_launch_agent() {
-  local cfg="$TS_TMP/agent-cfg" home="$TS_TMP/agent-home" verbs="$TS_TMP/launchctl.log"
-  local plist="$TS_TMP/agent-home/Library/LaunchAgents/com.behnam.bucklespring.plist" out
-  mkdir -p "$cfg/modules" "$home"
-  ln -s "$TMUX_CONFIG_DIR/AI" "$cfg/AI"
-  ln -s "$(cd "$HERE/.." && pwd)" "$cfg/modules/bucklespring"
-  : > "$cfg/tmux.conf"
-  "$REAL_TMUX" -L "$CFG_SOCK" -f "$cfg/tmux.conf" new-session -d -s cfg
-  mkdir -p "$TS_TMP/agent-bin"
-  printf '#!/usr/bin/env bash\nexec "%s" -L "%s" "$@"\n' "$REAL_TMUX" "$CFG_SOCK" > "$TS_TMP/agent-bin/tmux"
-  cat > "$TS_TMP/agent-bin/launchctl" <<'FAKE'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$AGENT_VERBS"
-loaded="$AGENT_STATE/loaded"
-start() { BUCKLE_FAKE_LINGER=1 "$BUCKLE_DIR/buckle" --pidfile "$BUCKLE_PIDFILE" >/dev/null 2>&1 & }
-case "$1" in
-  print)     [ -e "$loaded" ] ;;
-  bootstrap) [ -e "$loaded" ] && exit 37; : > "$loaded"; start ;;
-  kickstart) [ -e "$loaded" ] || exit 113
-             pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) && kill "$pid" 2>/dev/null
-             start ;;
-  bootout)   [ -e "$loaded" ] || exit 113; rm -f "$loaded"
-             pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) && kill "$pid" 2>/dev/null; exit 0 ;;
-  enable|disable) exit 0 ;;
-esac
-FAKE
-  chmod +x "$TS_TMP/agent-bin/tmux" "$TS_TMP/agent-bin/launchctl"
-  mkdir -p "$TS_TMP/agent-state"
-  agent() {
-    PATH="$TS_TMP/agent-bin:$PATH" TMUXD_SOCKET_ARGS="-L $CFG_SOCK" HOME="$home" \
-      TMUX_CONFIG_DIR="$cfg" BUCKLE_OS=Darwin BUCKLE_LAUNCHCTL="$TS_TMP/agent-bin/launchctl" \
-      AGENT_VERBS="$verbs" AGENT_STATE="$TS_TMP/agent-state" BUCKLE_DIR="$FAKE_BUCKLE_DIR" \
-      bash "$cfg/modules/bucklespring/plugin.sh" "$@"
-  }
-  clear_running; rm -f "$BUCKLE_LAUNCH_LOG" "$verbs"
-
-  agent start default
-  assert_rc0 "agent start: launchd's daemon claims the pidfile" wait_live_count 1
-  assert_eq "agent start: enable, look, bootstrap" \
-    "enable gui/$UID/com.behnam.bucklespring|print gui/$UID/com.behnam.bucklespring|bootstrap gui/$UID $plist" \
-    "$(rg -v '^print' "$verbs" | head -1)|$(rg '^print' "$verbs" | head -1)|$(rg '^bootstrap' "$verbs")"
-  assert_rc0 "agent start: the plist is valid" plutil -lint -s "$plist"
-  assert_contains "agent start: launchd runs the module's daemon with its three paths" "$(cat "$plist")" \
-    "<string>$FAKE_BUCKLE_DIR/buckle</string>"
-  assert_contains "agent start: the settings path rides the plist" "$(cat "$plist")" "<string>$BUCKLE_SETTINGS</string>"
-  assert_contains "agent start: a crash restarts, a clean exit does not" "$(tr -d '\t\n' < "$plist")" \
-    "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"
-  assert_eq "agent start: the manifest's durable row is the rendered plist" "$plist" \
-    "$(HOME="$home"; . "$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh"
-       tmux_plugin_expand_path "$(awk '$1 == "durable" { print $2 }' "$HERE/../plugin.conf")")"
-
-  : > "$verbs"
-  agent start Typewriter
-  assert_rc0 "agent profile: the live daemon is told to reread" wait_hups 1
-  assert_eq "agent profile: launchd is not touched" "" "$(rg -v '^print' "$verbs")"
-
-  : > "$verbs"
-  agent stop
-  assert_rc0 "agent stop: the daemon is gone" wait_live_count 0
-  assert_contains "agent stop: unload" "$(cat "$verbs")" "bootout gui/$UID/com.behnam.bucklespring"
-  assert_contains "agent stop: and stay down at the next login" "$(cat "$verbs")" "disable gui/$UID/com.behnam.bucklespring"
-
-  # A daemon from before the LaunchAgent: intent on, a live holder launchd never loaded.
-  mark_running
-  : > "$verbs"; rm -f "$BUCKLE_LAUNCH_LOG"
-  tmux set -g @buckle_enabled 1
-  "$REAL_TMUX" -L "$CFG_SOCK" set -g @buckle_enabled 1
-  agent restore
-  assert_contains "agent handover: the legacy daemon moves under launchd" "$(cat "$verbs")" "bootstrap gui/$UID $plist"
-  assert_rc0 "agent handover: exactly one daemon survives" wait_live_count 1
-
-  : > "$verbs"
-  agent teardown
-  assert_rc0 "agent teardown: the daemon is gone" wait_live_count 0
-  assert_contains "agent teardown: unload and disable" "$(cat "$verbs")" "disable gui/$UID/com.behnam.bucklespring"
-
-  # Purge through core, which runs the plugin's own purge (unload and disable) before it
-  # deletes the declared caches and the plist, the manifest's `durable` row.
-  printf 'bucklespring off\n' > "$cfg/plugins.conf"; : > "$cfg/plugins.local"
-  gtimeout 2m "$TMUXD_BIN" -L "$CFG_SOCK" state init >/dev/null 2>&1
-  : > "$verbs"
-  local lib="$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh"
-  PATH="$TS_TMP/agent-bin:$PATH" TMUXD_SOCKET_ARGS="-L $CFG_SOCK" HOME="$home" TMUX_CONFIG_DIR="$cfg" \
-    TMUX_PLUGINS_ROOT="$cfg/modules" TMUX_PLUGINS_CONFIG="$cfg/plugins.conf" \
-    TMUX_PLUGINS_LOCAL="$cfg/plugins.local" BUCKLE_OS=Darwin BUCKLE_LAUNCHCTL="$TS_TMP/agent-bin/launchctl" \
-    AGENT_VERBS="$verbs" AGENT_STATE="$TS_TMP/agent-state" BUCKLE_DIR="$FAKE_BUCKLE_DIR" \
-    "$lib" purge bucklespring >/dev/null 2>&1
-  assert_contains "agent purge: the plugin unloads the agent" "$(cat "$verbs")" "disable gui/$UID/com.behnam.bucklespring"
-  assert_rc1 "agent purge: core removes the plist" test -e "$plist"
-
-  # The suite's own server never loaded a checkout: it must not reach launchd at all.
-  : > "$verbs"
-  out=$(PATH="$TS_TMP/agent-bin:$PATH" HOME="$home" BUCKLE_OS=Darwin \
-    BUCKLE_LAUNCHCTL="$TS_TMP/agent-bin/launchctl" AGENT_VERBS="$verbs" AGENT_STATE="$TS_TMP/agent-state" \
-    BUCKLE_DIR="$FAKE_BUCKLE_DIR" TMUXD_SOCKET_ARGS="-L $TS_SOCK" bash "$BUCKLE" start default 2>&1)
-  assert_eq "agent guard: a server that loaded no checkout never reaches launchd" "" "$(cat "$verbs")"
-  assert_contains "agent guard: and says whose it is" "$out" "launchd belongs to the server that loaded"
-  clear_running
-  "$REAL_TMUX" -L "$CFG_SOCK" kill-server 2>/dev/null
-}
-
 test_native_menu_authority
 test_menu_sticky
 test_menu_permission_row
@@ -789,9 +694,9 @@ test_restore_keeps_disabled_off
 test_restore_stops_disabled_running
 test_restore_is_idempotent_when_running
 test_forced_restore_restarts_only_new_code
+test_restore_relaunches_a_previous_servers_holder
 test_unattended_build_is_quiet
 test_failed_build_popup_holds_and_preserves_rc
-test_launch_agent
 
 # --- Isolation: this suite never touches the machine's live daemon ------------
 # Twice a sandboxed suite reached bucklespring's reconciler, read no intent from its own
