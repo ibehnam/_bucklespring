@@ -751,11 +751,12 @@ FAKE
   printf 'bucklespring off\n' > "$cfg/plugins.conf"; : > "$cfg/plugins.local"
   gtimeout 2m "$TMUXD_BIN" -L "$CFG_SOCK" state init >/dev/null 2>&1
   : > "$verbs"
+  local lib="$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh"
   PATH="$TS_TMP/agent-bin:$PATH" TMUXD_SOCKET_ARGS="-L $CFG_SOCK" HOME="$home" TMUX_CONFIG_DIR="$cfg" \
     TMUX_PLUGINS_ROOT="$cfg/modules" TMUX_PLUGINS_CONFIG="$cfg/plugins.conf" \
     TMUX_PLUGINS_LOCAL="$cfg/plugins.local" BUCKLE_OS=Darwin BUCKLE_LAUNCHCTL="$TS_TMP/agent-bin/launchctl" \
     AGENT_VERBS="$verbs" AGENT_STATE="$TS_TMP/agent-state" BUCKLE_DIR="$FAKE_BUCKLE_DIR" \
-    "$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh" purge bucklespring >/dev/null 2>&1
+    "$lib" purge bucklespring >/dev/null 2>&1
   assert_contains "agent purge: the plugin unloads the agent" "$(cat "$verbs")" "disable gui/$UID/com.behnam.bucklespring"
   assert_rc1 "agent purge: core removes the plist" test -e "$plist"
 
