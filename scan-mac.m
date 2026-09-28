@@ -160,19 +160,27 @@ static int keystate[128];
 static CFMachPortRef g_tap;
 
 /*
- * A tap the system keeps disabling is a tap the system is refusing to feed: the
- * responsible application (the terminal that launched tmux) has lost its
- * Accessibility or Input Monitoring grant — typically because it was updated on
- * disk while running, so TCC can no longer validate it. Re-enabling works for
- * a tick and changes nothing. After TAP_DENIED_TICKS consecutive watchdog
- * re-enables with no key event between them, say so ONCE in a line the status
- * cell and `plugin.sh icon` read, keep retrying quietly, and announce recovery
- * when a key arrives again. Both lines are matched verbatim by
- * cells/bucklespring.rs and plugin.sh: change them together.
+ * A tap the system will not create, or keeps disabling, is a tap the system is
+ * refusing to feed: the responsible process has no Input Monitoring grant. Under
+ * launchd that process is buckle itself, and TCC checks a grant against the code
+ * signature it was given to; an ad-hoc-signed buckle that `make` rebuilt has a new
+ * one, so the old entry stops applying. A tap that cannot be created is said once
+ * and retried quietly by the watchdog, with the system's prompt requested once, so
+ * a missing grant never becomes a launchd restart loop. A tap the system keeps
+ * disabling is the same refusal arriving later: re-enabling works for a tick and
+ * changes nothing, so after TAP_DENIED_TICKS consecutive watchdog re-enables with
+ * no key event between them, the same prefix is said once. Either way the first
+ * key event announces recovery. The prefix and the recovery line are matched
+ * verbatim by cells/bucklespring.rs and plugin.sh: change them together.
  */
 #define TAP_DENIED_TICKS 3
+#define TAP_DENIED_LINE  "buckle: event tap disabled by the system"
+#define TAP_GRANT_HINT   "Grant buckle Input Monitoring in System Settings, Privacy & Security; " \
+                         "after a rebuild, remove buckle there and add it again"
 static int g_tap_watchdog_hits;   /* consecutive watchdog re-enables without an event */
 static int g_tap_denied;          /* the denied line has been printed */
+
+static int tap_create(void);
 
 static void tap_saw_event(void)
 {
@@ -196,13 +204,16 @@ static void tap_watchdog(CFRunLoopTimerRef timer, void *info)
 {
 	(void)timer;
 	(void)info;
-	if (!g_tap || CGEventTapIsEnabled(g_tap)) return;
+	if (!g_tap) {   /* never created: the grant may have landed since */
+		if (tap_create() == 0)
+			fprintf(stderr, "buckle: event tap created; waiting for the first key\n");
+		return;
+	}
+	if (CGEventTapIsEnabled(g_tap)) return;
 	tap_ensure_enabled("watchdog");
 	if (++g_tap_watchdog_hits >= TAP_DENIED_TICKS && !g_tap_denied) {
 		g_tap_denied = 1;
-		fprintf(stderr, "buckle: event tap disabled by the system; no keyboard events are delivered. "
-		    "Grant Accessibility/Input Monitoring to the terminal that launched tmux, or restart that "
-		    "terminal if it was updated while running\n");
+		fprintf(stderr, TAP_DENIED_LINE "; no keyboard events are delivered. " TAP_GRANT_HINT "\n");
 	}
 }
 
@@ -280,39 +291,63 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 
 
 
-int scan(int verbose)
+/*
+ * Create the event tap (key presses, releases, modifiers and media keys), add its source
+ * to this thread's run loop, which is the main one, and enable it. 0 on success; the
+ * system refuses creation to a process without the Input Monitoring grant.
+ */
+static int tap_create(void)
 {
 	CGEventMask        eventMask;
+	CFMachPortRef      tap;
 	CFRunLoopSourceRef runLoopSource;
-	CFRunLoopTimerRef  watchdogTimer;
-
-	/* Create an event tap. We are interested in key presses. */
 
 	eventMask = ((1 << kCGEventKeyDown)
 	           | (1 << kCGEventKeyUp)
 	           | (1 << kCGEventFlagsChanged)
 	           | (1 << NX_SYSDEFINED));
-	g_tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
-	                         kCGEventTapOptionListenOnly, eventMask,
-	                         myCGEventCallback, NULL);
-	if (!g_tap) {
-		fprintf(stderr, "failed to create event tap\n");
-		exit(1);
+	tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+	                       kCGEventTapOptionListenOnly, eventMask,
+	                       myCGEventCallback, NULL);
+	if (!tap)
+		return -1;
+
+	runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+	if (!runLoopSource) {
+		CFMachPortInvalidate(tap);
+		CFRelease(tap);
+		return -1;
+	}
+	CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
+	CFRelease(runLoopSource);   /* the run loop holds it now */
+
+	g_tap = tap;
+	CGEventTapEnable(g_tap, true);
+	return 0;
+}
+
+
+int scan(int verbose)
+{
+	CFRunLoopTimerRef watchdogTimer;
+
+	/* A refused tap is not fatal: exiting would only make launchd restart a process that
+	 * still has no grant. Say so once, request the grant once (that lists buckle under
+	 * Input Monitoring and shows the system prompt), and let the watchdog retry creation
+	 * every tick; the audio watchdog on this run loop keeps running meanwhile. The denied
+	 * state makes the first key event after a late creation announce recovery. */
+	if (tap_create() != 0) {
+		g_tap_denied = 1;
+		fprintf(stderr, TAP_DENIED_LINE "; the tap could not be created. " TAP_GRANT_HINT "\n");
+		if (!CGPreflightListenEventAccess())
+			CGRequestListenEventAccess();
 	}
 
-	/* Create a run loop source. */
-	runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, g_tap, 0);
 	watchdogTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
 	                                     CFAbsoluteTimeGetCurrent() + 5.0, 5.0,
 	                                     0, 0, tap_watchdog, NULL);
-
-	/* Add to the current run loop. */
-	CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
 	if (watchdogTimer)
 		CFRunLoopAddTimer(CFRunLoopGetCurrent(), watchdogTimer, kCFRunLoopCommonModes);
-
-	/* Enable the event tap. */
-	CGEventTapEnable(g_tap, true);
 
 	/* Set it all running. */
 	CFRunLoopRun();

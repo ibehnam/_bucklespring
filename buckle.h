@@ -14,6 +14,8 @@ int  audio_open(const char *device);                   /* NULL = the system defa
 void audio_close(void);
 int  audio_load(const char *path);
 int  audio_play(int sample, double pan, int gain_pct);  /* pan -1 (left) .. 1 (right) */
+void audio_forget_samples(void);                       /* free every sample; all handles are invalid after */
+void audio_monitor(const char *heartbeat_path);        /* output watchdog on the main run loop; NULL = no heartbeat file */
 void audio_list_devices(void);
 int  audio_check(const char *device);                  /* --audio-check seam: 0 healthy, 1 not, 2 no device */
 

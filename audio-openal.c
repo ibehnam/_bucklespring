@@ -93,6 +93,26 @@ int audio_play(int sample, double pan, int gain_pct)
 	return 0;
 }
 
+/* A new sound pack: stop and drop every source and buffer; main.c reloads samples lazily.
+ * The source goes first, because a buffer still attached to one cannot be deleted. */
+void audio_forget_samples(void)
+{
+	for (int i = 1; i <= nsamples; i++) {
+		alSourceStop(srcs[i]);
+		alDeleteSources(1, &srcs[i]);
+		alDeleteBuffers(1, &bufs[i]);
+		srcs[i] = bufs[i] = 0;
+	}
+	nsamples = 0;
+	(void)alGetError();
+}
+
+/* PulseAudio and PipeWire move an unpinned stream themselves: no watchdog, no heartbeat file. */
+void audio_monitor(const char *heartbeat_path)
+{
+	(void)heartbeat_path;
+}
+
 void audio_list_devices(void)
 {
 	const ALCchar *s = alcGetString(NULL, ALC_ALL_DEVICES_SPECIFIER);

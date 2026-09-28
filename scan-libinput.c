@@ -106,7 +106,13 @@ int scan(int verbose)
         fds.events = POLLIN;
         fds.revents = 0;
 
-	while(poll(&fds, 1, -1) > -1) {
+	for(;;) {
+		if(poll(&fds, 1, -1) < 0) {
+			/* A signal handler ran: SIGHUP only asks main.c for a settings reload. */
+			if(errno == EINTR)
+				continue;
+			break;
+		}
 		handle_events(li);
 	}
 

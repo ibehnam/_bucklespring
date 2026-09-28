@@ -2,9 +2,10 @@
 # Bucklespring plugin menu + lifecycle coverage.
 #
 # Menu coverage asserts every actionable archetype (profile radio, volume radio, Running
-# toggle) receives the constructor-derived sticky reopen. Lifecycle coverage proves pidfile
-# identity, orphan-free profile switches, and init/restore reconciliation without opening a
-# build popup.
+# toggle) receives the constructor-derived sticky reopen. Lifecycle coverage proves the
+# daemon's own pidfile claim, settings delivered by SIGHUP instead of a relaunch, init/restore
+# reconciliation without a build popup, and the macOS LaunchAgent verbs through a recording
+# `launchctl`.
 #
 # SEAM: plugin.sh's CLI case has no source-guard (sourcing it would run the case),
 # so we run `menu` as a SUBPROCESS behind a display-menu-capturing `tmux` shim (mirrors
@@ -13,9 +14,12 @@
 # (BUCKLE_PIDFILE under its own cache root) and a fake buckle; nothing real is launched or
 # built. There is deliberately no `pgrep` shim: identity is the pidfile, so the production
 # daemon on this machine is invisible here by construction, and the suite proves that.
+# BUCKLE_OS=Linux keeps every ordinary case on the detached launch; the LaunchAgent cases
+# force Darwin, a fake `launchctl`, and a server that loaded a scratch checkout, because only
+# that server may manage the machine-global agent.
 #
 # LANE: integration
-# BUDGET: 20
+# BUDGET: 30
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -30,11 +34,9 @@ REAL_BUCKLE_BIN="$HERE/../buckle"
 tsetup
 export XDG_CACHE_HOME="$TS_TMP/cache"
 export XDG_STATE_HOME="$TS_TMP/state"
-# This suite exercises the BASH icon writer. Every compile here (the authority test, each
-# lifecycle round trip) re-reads the plugin layers, and this machine's overlay may switch
-# `tmuxd.bucklespring` on, which correctly hands the cell to a daemon this server does not
-# run. Sandbox the machine layer to an empty file so the switch stays at its shipped default;
-# the native cell has its own parity suite (AI/tests/test-tmuxd-parity.sh).
+export BUCKLE_OS=Linux
+# The committed defaults, not this machine's overlay: every compile here re-reads the
+# plugin layers (docs/testing.md).
 export TMUX_PLUGINS_MACHINE_CONFIG="$TS_TMP/plugins.machine"
 : > "$TMUX_PLUGINS_MACHINE_CONFIG"
 # quiet-commit persists through the native `tmuxd preferences` setter, which resolves its
@@ -47,6 +49,7 @@ export TMUXD_SOCKET_ARGS="-L $TS_SOCK"
 gtimeout 2m "$TMUXD_BIN" state init
 gtimeout 2m bash "$PERSIST" bootstrap
 tmux set -g @plugin_preference_options "$(bash "$PERSIST" preference-names | tr '\n' ' ')"
+CFG_SOCK="$TS_SOCK-cfg"
 cleanup() {
   if [ -f "$BUCKLE_PIDFILE" ]; then
     pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) || pid=""
@@ -55,6 +58,7 @@ cleanup() {
   if [ -f "${BUCKLE_PID_LOG:-}" ]; then
     while read -r pid; do kill -KILL "$pid" 2>/dev/null || true; done < "$BUCKLE_PID_LOG"
   fi
+  "$REAL_TMUX" -L "$CFG_SOCK" kill-server 2>/dev/null
   tteardown
 }
 trap cleanup EXIT
@@ -92,13 +96,16 @@ chmod +x "$TS_SHIMDIR/tmux"
 BUCKLE_CACHE_DIR="$TS_TMP/buckle-cache"
 BUCKLE_PIDFILE="$BUCKLE_CACHE_DIR/buckle.pid"
 BUCKLE_LOG="$BUCKLE_CACHE_DIR/buckle.log"
+BUCKLE_SETTINGS="$BUCKLE_CACHE_DIR/settings"
 BUCKLE_PID_LOG="$TS_TMP/buckle.pids"
-export BUCKLE_CACHE_DIR BUCKLE_PIDFILE BUCKLE_LOG BUCKLE_PID_LOG
+BUCKLE_HUP_LOG="$TS_TMP/buckle.hups"
+export BUCKLE_CACHE_DIR BUCKLE_PIDFILE BUCKLE_LOG BUCKLE_SETTINGS BUCKLE_PID_LOG BUCKLE_HUP_LOG
 # The live daemons on this machine, if any: the suite must leave every one of them alive.
 PRODUCTION_BUCKLE_PIDS="$(pgrep -x buckle 2>/dev/null | tr '\n' ' ')"
 
-# Restore runs a fake stale executable from an env-overridden plugin dir. The
-# newer source fixture proves the nobuild path does not invoke display-popup.
+# A fake daemon with the real one's contract: it writes its own pidfile (the claim),
+# removes it on TERM, and records every SIGHUP instead of dying. Its binary is current
+# (its one source is older), so only the case that ages it exercises a build.
 FAKE_BUCKLE_DIR="$TS_TMP/bucklespring"
 BUCKLE_LAUNCH_LOG="$TS_TMP/buckle.launches"
 export BUCKLE_LAUNCH_LOG
@@ -110,15 +117,19 @@ cat > "$FAKE_BUCKLE_DIR/buckle" <<'SHIM'
 # not a launch the plugin made, so it must not count as one.
 [ -n "${BUCKLE_FAKE_MARK:-}" ] || printf '%s\n' "$*" >> "$BUCKLE_LAUNCH_LOG"
 printf '%s\n' "$$" >> "$BUCKLE_PID_LOG"
+pidfile=""
+while [ "$#" -gt 0 ]; do [ "$1" = --pidfile ] && pidfile=$2; shift; done
+[ -z "$pidfile" ] || printf '%s\n' "$$" > "$pidfile"
 if [ "${BUCKLE_FAKE_LINGER:-}" = 1 ]; then
-  trap 'exit 0' TERM INT
+  trap '[ -z "$pidfile" ] || rm -f "$pidfile"; exit 0' TERM INT
+  trap 'printf "%s\n" "$$" >> "$BUCKLE_HUP_LOG"' HUP
   # sleep: hold — stay alive (killable) until the test tears the fake down
   while :; do sleep 0.2 & wait $!; done
 fi
 SHIM
 chmod +x "$FAKE_BUCKLE_DIR/buckle"
 touch -t 202001010000 "$FAKE_BUCKLE_DIR/buckle"
-touch -t 202101010000 "$FAKE_BUCKLE_DIR/source.c"
+touch -t 201901010000 "$FAKE_BUCKLE_DIR/source.c"
 
 printf '== test-bucklespring.sh ==\n'
 
@@ -130,12 +141,25 @@ launch_count() {
   fi
 }
 
+hup_count() {
+  if [ -f "$BUCKLE_HUP_LOG" ]; then wc -l < "$BUCKLE_HUP_LOG" | tr -d ' '; else printf '0'; fi
+}
+
 wait_for_launch() {
   local i=0
   while [ "$i" -lt 50 ] && [ "$(launch_count)" -lt 1 ]; do
     perl -e 'select(undef,undef,undef,0.02)' 2>/dev/null || sleep 1 # sleep: guard — retry tick; the 50-try cap pins the bound
     i=$((i + 1))
   done
+}
+
+wait_hups() { # count
+  local i=0
+  while [ "$i" -lt 50 ] && [ "$(hup_count)" -lt "$1" ]; do
+    perl -e 'select(undef,undef,undef,0.02)' 2>/dev/null || sleep 1 # sleep: guard — retry tick; the 50-try cap pins the bound
+    i=$((i + 1))
+  done
+  [ "$(hup_count)" -ge "$1" ]
 }
 
 live_launch_pids() {
@@ -158,12 +182,12 @@ wait_live_count() { # count
 
 mark_running() {
   clear_running
-  # The lingering fake IS the live instance, and the pidfile names it: is_running validates
-  # the holder's command line against the executable name, which a bare `sleep` would fail.
-  BUCKLE_FAKE_MARK=1 BUCKLE_FAKE_LINGER=1 "$FAKE_BUCKLE_DIR/buckle" &
-  printf '%s\n' "$!" >> "$BUCKLE_PID_LOG"
+  # The lingering fake IS the live instance and claims the pidfile itself: is_running
+  # validates the holder's command line against the executable name.
   mkdir -p "$BUCKLE_CACHE_DIR"
-  printf '%s\n' "$!" > "$BUCKLE_PIDFILE"
+  BUCKLE_FAKE_MARK=1 BUCKLE_FAKE_LINGER=1 "$FAKE_BUCKLE_DIR/buckle" --pidfile "$BUCKLE_PIDFILE" &
+  printf '%s\n' "$!" >> "$BUCKLE_PID_LOG"
+  wait_file "$BUCKLE_PIDFILE" || true
 }
 
 clear_running() {
@@ -173,8 +197,10 @@ clear_running() {
       wait "$pid" 2>/dev/null || true
     done < "$BUCKLE_PID_LOG"
   fi
-  rm -f "$BUCKLE_PID_LOG" "$BUCKLE_PIDFILE"
+  rm -f "$BUCKLE_PID_LOG" "$BUCKLE_PIDFILE" "$BUCKLE_HUP_LOG" "$BUCKLE_SETTINGS"
 }
+
+settings() { cat "$BUCKLE_SETTINGS" 2>/dev/null; }
 
 # --- Native authority: one owner enumerates and validates profiles ------------
 test_native_menu_authority() {
@@ -236,13 +262,26 @@ test_menu_sticky() {
   assert_contains "buckle: profile row chains reopen + selection"      "$dump" "start \"default\" ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT=0 $reopen"
   assert_contains "buckle: volume row (100%) chains reopen (sticky)"  "$dump" "gain \"100\" ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT="
   assert_contains "buckle: Running row chains reopen (sticky)"        "$dump" "toggle ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT="
-  # The daemon toggle is now the shared ✓+bold "Running" checkbox (bold + ✓ when live,
-  # blank gutter when stopped), not a bare Start/Stop verb. The live/stopped byte form is
-  # host-dependent (is_running also greps for a running buckle), so pin the label and the
-  # absence of the retired verb, matching menu.rs's `label == "Running"` fixture.
   assert_contains "buckle: daemon toggle is the Running checkbox"     "$dump" "Running"
   assert_not_contains "buckle: the retired Start verb toggle is gone" "$dump" $'\nStart\n'
   assert_not_contains "buckle: the retired Stop verb toggle is gone"  "$dump" $'\nStop\n'
+}
+
+# --- The permission row follows the daemon's published verdict ----------------
+# The status cell is the one judge of a refused keyboard tap; the menu offers the Input
+# Monitoring pane only while the published icon is the permission form.
+test_menu_permission_row() {
+  tmux set -gu @buckle_icon_color
+  bash "$BUCKLE" menu </dev/null
+  assert_not_contains "buckle permission: no row without a refused tap" "$(cat "$MENU_ARGS")" "Input Monitoring"
+  tmux set -g @buckle_icon_color "${TMUX_ORANGE}${TMUX_BUCKLE_ICON}${TMUX_RESET}"
+  bash "$BUCKLE" menu </dev/null
+  assert_contains "buckle permission: a refused tap offers the pane" "$(cat "$MENU_ARGS")" "Input Monitoring → open Settings"
+  assert_contains "buckle permission: the row opens the pane" "$(cat "$MENU_ARGS")" "open-perms"
+  tmux set -g @buckle_icon_color "${TMUX_GREEN}${TMUX_BUCKLE_ICON}${TMUX_RESET}"
+  bash "$BUCKLE" menu </dev/null
+  assert_not_contains "buckle permission: a running icon hides it" "$(cat "$MENU_ARGS")" "Input Monitoring"
+  tmux set -gu @buckle_icon_color
 }
 
 # --- The quiet row: default OFF, and a set window shown + editable ------------
@@ -279,11 +318,10 @@ test_menu_quiet_row() {
   tmux set -gu @buckle_quiet_to 2>/dev/null || true
 }
 
-# --- quiet-commit: parse → persist → restart a RUNNING buckle -----------------
-# The window is baked into buckle's argv at launch (only the time COMPARISON is in C), so a
-# live daemon has to be relaunched to learn a new one — do_gain's rule applied to the other
-# launch-time value. A stopped buckle must stay stopped, exactly as picking a volume does.
-test_quiet_commit_restarts_running() {
+# --- quiet-commit: parse → persist → the settings file → SIGHUP ---------------
+# The daemon rereads its settings file on SIGHUP, so a live daemon learns a new window
+# without a relaunch; a stopped one stays stopped, exactly as picking a volume does.
+test_quiet_commit_signals_running() {
   rm -f "$BUCKLE_LAUNCH_LOG"
   mark_running
   tmux set -g @buckle_gain 50
@@ -291,7 +329,6 @@ test_quiet_commit_restarts_running() {
   tmux set -g @buckle_quiet_input "22:30–06:00"
 
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" quiet-commit
-  wait_for_launch
 
   assert_eq "buckle quiet-commit: window parsed to minutes (from)" "1350" \
     "$(tmux show -gqv @buckle_quiet_from)"
@@ -299,12 +336,13 @@ test_quiet_commit_restarts_running() {
     "$(tmux show -gqv @buckle_quiet_to)"
   assert_eq "buckle quiet-commit: input placeholder unset again"   "" \
     "$(tmux show -gqv @buckle_quiet_input)"
-  assert_eq "buckle quiet-commit: a running buckle is relaunched"  "1" "$(launch_count)"
-  # The window reaches the argv; the quiet LEVEL is still derived from TMUX_VOLUME_LEVELS
-  # in the shell, so the level domain stays single-sourced.
-  assert_contains "buckle quiet-commit: window + floor reach launch argv" \
-    "$(cat "$BUCKLE_LAUNCH_LOG" 2>/dev/null)" \
-    "-g 50 --quiet-from 1350 --quiet-to 360 --quiet-gain $(tmux_volume_floor)"
+  # The quiet LEVEL is still derived from TMUX_VOLUME_LEVELS in the shell, so the level
+  # domain stays single-sourced.
+  assert_eq "buckle quiet-commit: window + floor reach the settings file" \
+    "gain=50 quiet_from=1350 quiet_to=360 quiet_gain=$(tmux_volume_floor) profile=default" \
+    "$(settings | tr '\n' ' ' | sed 's/ $//')"
+  assert_rc0 "buckle quiet-commit: the live daemon is told to reread" wait_hups 1
+  assert_eq "buckle quiet-commit: and is never relaunched" "0" "$(launch_count)"
   assert_contains "buckle quiet-commit: menu reopen is detached" \
     "$(cat "$RUN_SHELL_LOG")" "plugin.sh' menu -"
 
@@ -321,12 +359,25 @@ test_quiet_commit_restarts_running() {
   mark_running
   tmux set -g @buckle_quiet_input ""
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" quiet-commit
-  wait_for_launch
   assert_eq "buckle quiet-commit: empty commits OFF (from == to)" "0 0" \
     "$(tmux show -gqv @buckle_quiet_from) $(tmux show -gqv @buckle_quiet_to)"
-  assert_contains "buckle quiet-commit: off launches inert flags" \
-    "$(cat "$BUCKLE_LAUNCH_LOG" 2>/dev/null)" "--quiet-from 0 --quiet-to 0"
+  assert_contains "buckle quiet-commit: off reaches the settings file" "$(settings)" $'quiet_from=0\nquiet_to=0'
   clear_running
+}
+
+# --- gain: a new volume is a settings change, never a start -------------------
+test_gain_signals_running() {
+  rm -f "$BUCKLE_LAUNCH_LOG"
+  mark_running
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" gain 25
+  assert_contains "buckle gain: the level reaches the settings file" "$(settings)" "gain=25"
+  assert_rc0 "buckle gain: the live daemon is told to reread" wait_hups 1
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" gain 25
+  assert_eq "buckle gain: an unchanged level signals nothing" "1" "$(hup_count)"
+  clear_running
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" gain 50
+  assert_eq "buckle gain: a stopped buckle is not started" "0" "$(launch_count)"
+  tmux set -g @buckle_gain 100
 }
 
 _assert_pidfile_start_stop_shell() { # shell label
@@ -334,13 +385,15 @@ _assert_pidfile_start_stop_shell() { # shell label
   clear_running
   rm -f "$BUCKLE_LAUNCH_LOG"
   BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" "$shell" "$BUCKLE" start default
-  assert_rc0 "buckle daemon ($label): start writes a pidfile" wait_file "$BUCKLE_PIDFILE"
+  assert_rc0 "buckle daemon ($label): the daemon claims its pidfile" wait_file "$BUCKLE_PIDFILE"
   assert_rc0 "buckle daemon ($label): fake daemon records its pid" wait_file "$BUCKLE_PID_LOG"
   pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null)
   launched=$(tail -n 1 "$BUCKLE_PID_LOG" 2>/dev/null)
   assert_eq "buckle daemon ($label): pidfile names the fake daemon itself" "$launched" "$pid"
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
   assert_eq "buckle daemon ($label): launch owns an isolated process group" "$pid" "$pgid"
+  assert_contains "buckle daemon ($label): the daemon gets its log, pidfile, and settings" \
+    "$(cat "$BUCKLE_LAUNCH_LOG")" "--log $BUCKLE_LOG --pidfile $BUCKLE_PIDFILE --settings $BUCKLE_SETTINGS"
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" "$shell" "$BUCKLE" stop
   assert_rc0 "buckle daemon ($label): stop kills the daemon" wait_dead "$pid"
   assert_rc0 "buckle daemon ($label): no fake instance survives stop" wait_live_count 0
@@ -352,16 +405,17 @@ test_pidfile_start_stop() {
   _assert_pidfile_start_stop_shell /bin/bash system-bash
 }
 
-test_profile_switch_replaces_daemon() {
+test_profile_switch_signals_the_daemon() {
   clear_running
   rm -f "$BUCKLE_LAUNCH_LOG"
   BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" start "Japanese Black"
   assert_rc0 "buckle switch: first profile has one live daemon" wait_live_count 1
+  assert_contains "buckle switch: the profile reaches the settings file" "$(settings)" "profile=Japanese Black"
   BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" start "Typewriter"
-  assert_rc0 "buckle switch: replacement settles at one live daemon" wait_live_count 1
-  assert_eq "buckle switch: exactly two launches occurred" 2 "$(launch_count)"
-  assert_contains "buckle switch: survivor uses the new profile" \
-    "$(tail -n 1 "$BUCKLE_LAUNCH_LOG")" "-p ./wav-klack/Typewriter/"
+  assert_rc0 "buckle switch: the running daemon is told to reread" wait_hups 1
+  assert_eq "buckle switch: exactly one launch occurred" 1 "$(launch_count)"
+  assert_rc0 "buckle switch: still one live daemon" wait_live_count 1
+  assert_contains "buckle switch: the new profile is in the settings file" "$(settings)" "profile=Typewriter"
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" stop
   assert_rc0 "buckle switch: final stop leaves no fake" wait_live_count 0
 }
@@ -413,6 +467,57 @@ test_gain_at_parity() {
   assert_eq "buckle: --gain-at agrees with tmux_quiet_active over the whole table" "" "$bad"
 }
 
+# --- The settings file the shell writes is the one the daemon reads -----------
+# The same rule through the other door: the plugin projects the preferences into the
+# settings file, and the real binary's --gain-at reads it back.
+test_settings_reach_the_binary() {
+  if [ ! -x "$REAL_BUCKLE_BIN" ] || ! "$REAL_BUCKLE_BIN" --settings /dev/null --gain-at 0 >/dev/null 2>&1; then
+    skip "buckle --settings: no built binary with settings support"
+    return 0
+  fi
+  clear_running
+  tmux set -g @buckle_gain 50 \; set -g @buckle_quiet_from 60 \; set -g @buckle_quiet_to 120
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" gain 50
+  assert_eq "buckle settings: inside the window the binary plays the floor" "$(tmux_volume_floor)" \
+    "$("$REAL_BUCKLE_BIN" --settings "$BUCKLE_SETTINGS" --gain-at 90 2>/dev/null)"
+  assert_eq "buckle settings: outside it, the gain" "50" \
+    "$("$REAL_BUCKLE_BIN" --settings "$BUCKLE_SETTINGS" --gain-at 200 2>/dev/null)"
+  tmux set -g @buckle_gain 100 \; set -gu @buckle_quiet_from \; set -gu @buckle_quiet_to
+}
+
+# --- The daemon's claim: one holder per pidfile -------------------------------
+# The real binary claims the pidfile under an exclusive lock: a second daemon names the
+# holder and exits 75, and TERM ends the holder cleanly and removes the pidfile.
+test_claim_is_exclusive() {
+  local dir pid rc=0
+  if [ ! -x "$REAL_BUCKLE_BIN" ] || ! "$REAL_BUCKLE_BIN" --help 2>&1 | rg -q -- '--claim-only'; then
+    skip "buckle --claim-only: no built binary with the claim"
+    return 0
+  fi
+  dir="$TS_TMP/claim"; mkdir -p "$dir"
+  "$REAL_BUCKLE_BIN" --log "$dir/buckle.log" --pidfile "$dir/buckle.pid" --claim-only &
+  pid=$!
+  assert_rc0 "buckle claim: the holder writes its pid" wait_file_contains "$dir/buckle.pid" "$pid"
+  assert_rc0 "buckle claim: and starts its own log" wait_file_contains "$dir/buckle.log" "buckle: started, pid $pid"
+  # A refused daemon touches nothing: it says so on the stderr it inherited (under launchd,
+  # the holder's log, opened for append) and never rotates the holder's log aside.
+  gtimeout 10s "$REAL_BUCKLE_BIN" --log "$dir/buckle.log" --pidfile "$dir/buckle.pid" --claim-only \
+    2>"$dir/second.err" || rc=$?
+  assert_eq "buckle claim: a second daemon exits 75" 75 "$rc"
+  assert_contains "buckle claim: and names the holder's pidfile on its stderr" "$(cat "$dir/second.err")" \
+    "buckle: another holder owns $dir/buckle.pid"
+  assert_contains "buckle claim: the holder's log stays in place" "$(cat "$dir/buckle.log")" \
+    "buckle: started, pid $pid"
+  assert_rc1 "buckle claim: and is never rotated by the refused daemon" test -e "$dir/buckle.log.1"
+  assert_eq "buckle claim: the pidfile still names the first holder" "$pid" "$(cat "$dir/buckle.pid")"
+  kill -HUP "$pid"
+  perl -e 'select(undef,undef,undef,0.2)' # sleep: hold — give a wrongly fatal HUP time to land
+  assert_rc0 "buckle claim: SIGHUP rereads, it never ends the holder" kill -0 "$pid"
+  kill -TERM "$pid"; rc=0; wait "$pid" || rc=$?
+  assert_eq "buckle claim: TERM is a clean exit" 0 "$rc"
+  assert_rc1 "buckle claim: and removes the pidfile" test -e "$dir/buckle.pid"
+}
+
 # --- The output backend: renders, and on the device it should -----------------
 # --audio-check opens the real output silently (no click), proves the render callback runs,
 # and that the unit sits on the system default output — the property the whole "headphones
@@ -449,17 +554,12 @@ test_restore_starts_enabled() {
   wait_for_launch
 
   assert_eq "buckle restore: enabled + stopped launches once" "1" "$(launch_count)"
-  assert_contains "buckle restore: saved gain reaches launch argv" \
-    "$(cat "$BUCKLE_LAUNCH_LOG" 2>/dev/null)" "-g 50"
-  # The restored window rides the same argv — a rebooted server comes back dimming on the
-  # user's schedule without any further action.
-  assert_contains "buckle restore: saved quiet window reaches launch argv" \
-    "$(cat "$BUCKLE_LAUNCH_LOG" 2>/dev/null)" "--quiet-from 1200 --quiet-to 420 --quiet-gain 25"
-  # The stale-source fixture would make ensure_binary rebuild; the unattended restore path
-  # passes `nobuild`, so no build popup may appear (previously only implied by the fixture).
+  # The restored window rides the settings file: a rebooted server comes back dimming on
+  # the user's schedule without any further action.
+  assert_eq "buckle restore: saved preferences reach the settings file" \
+    "gain=50 quiet_from=1200 quiet_to=420 quiet_gain=25 profile=Japanese Black" \
+    "$(settings | tr '\n' ' ' | sed 's/ $//')"
   assert_eq "buckle restore: unattended path opens no build popup" "" "$(cat "$POPUP_LOG")"
-  assert_contains "buckle restore: multi-word profile reaches launch argv" \
-    "$(cat "$BUCKLE_LAUNCH_LOG" 2>/dev/null)" "-p ./wav-klack/Japanese Black/"
   assert_eq "buckle restore: saved profile remains intact" \
     "Japanese Black" "$(tmux show -gqv @buckle_profile)"
 }
@@ -473,8 +573,7 @@ test_restore_keeps_disabled_off() {
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" restore
 
   assert_eq "buckle restore: disabled intent launches nothing" "0" "$(launch_count)"
-  assert_contains "buckle restore: disabled intent paints the off icon" \
-    "$(tmux show -gqv @buckle_icon_color)" "colour196"
+  assert_eq "buckle restore: the plugin never writes the icon" "" "$(tmux show -gqv @buckle_icon_color)"
 }
 
 test_restore_stops_disabled_running() {
@@ -486,24 +585,24 @@ test_restore_stops_disabled_running() {
 
   assert_rc0 "buckle restore: disabled intent stops a live daemon" wait_live_count 0
   assert_eq "buckle restore: disabling launches no replacement" "0" "$(launch_count)"
-  assert_contains "buckle restore: stopped daemon paints the off icon" \
-    "$(tmux show -gqv @buckle_icon_color)" "colour196"
 }
 
 test_restore_is_idempotent_when_running() {
   rm -f "$BUCKLE_LAUNCH_LOG"
   mark_running
   tmux set -g @buckle_enabled 1
-  tmux set -gu @buckle_icon_color 2>/dev/null || true
 
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" restore
-
   assert_eq "buckle restore: already-running daemon is not relaunched" "0" "$(launch_count)"
-  assert_contains "buckle restore: already-running daemon paints the on icon" \
-    "$(tmux show -gqv @buckle_icon_color)" "colour84"
+  assert_rc0 "buckle restore: a first settings file is announced" wait_hups 1
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" restore
+  assert_eq "buckle restore: current settings signal nothing" "1" "$(hup_count)"
+  clear_running
 }
 
-test_forced_restore_restarts_running() {
+# A forced convergence (core's apply after every native menu choice) restarts a live
+# daemon only for new code: a binary newer than the holder's claim.
+test_forced_restore_restarts_only_new_code() {
   rm -f "$BUCKLE_LAUNCH_LOG"
   mark_running
   tmux set -g @buckle_enabled 1
@@ -511,11 +610,44 @@ test_forced_restore_restarts_running() {
 
   TMUX_PLUGIN_FORCE_CONVERGE=1 BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" \
     bash "$BUCKLE" restore
+  assert_eq "buckle forced restore: current code is never relaunched" "0" "$(launch_count)"
 
-  assert_rc0 "buckle forced restore: replacement settles at one daemon" wait_live_count 1
-  assert_eq "buckle forced restore: running daemon relaunches once" "1" "$(launch_count)"
-  assert_contains "buckle forced restore: latest gain reaches replacement" \
-    "$(cat "$BUCKLE_LAUNCH_LOG" 2>/dev/null)" "-g 50"
+  touch -t 203001010000 "$FAKE_BUCKLE_DIR/buckle"
+  TMUX_PLUGIN_FORCE_CONVERGE=1 BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" \
+    bash "$BUCKLE" restore
+  assert_rc0 "buckle forced restore: new code settles at one daemon" wait_live_count 1
+  assert_eq "buckle forced restore: new code relaunches once" "1" "$(launch_count)"
+  touch -t 202001010000 "$FAKE_BUCKLE_DIR/buckle"
+  clear_running
+  tmux set -g @buckle_gain 100
+}
+
+# An unattended reconcile never opens a popup and never launches a binary older than its
+# sources: the daemon's argv contract moves with them, and under launchd a binary that
+# refused it would restart every five seconds. The build runs quietly into its log.
+test_unattended_build_is_quiet() {
+  local err="$TS_TMP/restore.err"
+  clear_running
+  rm -f "$BUCKLE_LAUNCH_LOG" "$TS_TMP/make.log" "$BUCKLE_CACHE_DIR/build.log"
+  : > "$POPUP_LOG"
+  tmux set -g @buckle_enabled 1
+  touch -t 202101010000 "$FAKE_BUCKLE_DIR/source.c"
+  printf '#!/usr/bin/env bash\nprintf "make ran\\n" >> "%s"\nprintf "no rule\\n"\nexit 2\n' "$TS_TMP/make.log" > "$TS_SHIMDIR/make"
+  chmod +x "$TS_SHIMDIR/make"
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" restore 2>"$err"
+  assert_contains "unattended build: a stale binary is rebuilt" "$(cat "$TS_TMP/make.log" 2>/dev/null)" "make ran"
+  assert_eq "unattended build: one that stays stale is never launched" 0 "$(launch_count)"
+  assert_contains "unattended build: and the refusal says why" "$(cat "$err")" "older than its sources"
+  assert_contains "unattended build: the build output lands in its log" \
+    "$(cat "$BUCKLE_CACHE_DIR/build.log" 2>/dev/null)" "no rule"
+  printf '#!/usr/bin/env bash\ntouch "%s/buckle"\n' "$FAKE_BUCKLE_DIR" > "$TS_SHIMDIR/make"
+  BUCKLE_FAKE_LINGER=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" restore
+  wait_for_launch
+  assert_eq "unattended build: a successful build launches once" 1 "$(launch_count)"
+  assert_eq "unattended build: never through a popup" "" "$(cat "$POPUP_LOG")"
+  rm -f "$TS_SHIMDIR/make"
+  touch -t 202001010000 "$FAKE_BUCKLE_DIR/buckle"
+  touch -t 201901010000 "$FAKE_BUCKLE_DIR/source.c"
   clear_running
 }
 
@@ -533,21 +665,132 @@ test_failed_build_popup_holds_and_preserves_rc() {
   rm -f "$TS_SHIMDIR/make"
 }
 
+# --- The LaunchAgent ------------------------------------------------------------
+# macOS supervises the daemon with launchd. The agent is machine-global, so only the server
+# that loaded this checkout may manage it: a scratch checkout with an empty tmux.conf, a
+# second isolated server started from it, a scratch HOME for the plist, and a recording
+# `launchctl` whose bootstrap and kickstart start the fake daemon and whose bootout stops it.
+test_launch_agent() {
+  local cfg="$TS_TMP/agent-cfg" home="$TS_TMP/agent-home" verbs="$TS_TMP/launchctl.log"
+  local plist="$TS_TMP/agent-home/Library/LaunchAgents/com.behnam.bucklespring.plist" out
+  mkdir -p "$cfg/modules" "$home"
+  ln -s "$TMUX_CONFIG_DIR/AI" "$cfg/AI"
+  ln -s "$(cd "$HERE/.." && pwd)" "$cfg/modules/bucklespring"
+  : > "$cfg/tmux.conf"
+  "$REAL_TMUX" -L "$CFG_SOCK" -f "$cfg/tmux.conf" new-session -d -s cfg
+  mkdir -p "$TS_TMP/agent-bin"
+  printf '#!/usr/bin/env bash\nexec "%s" -L "%s" "$@"\n' "$REAL_TMUX" "$CFG_SOCK" > "$TS_TMP/agent-bin/tmux"
+  cat > "$TS_TMP/agent-bin/launchctl" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AGENT_VERBS"
+loaded="$AGENT_STATE/loaded"
+start() { BUCKLE_FAKE_LINGER=1 "$BUCKLE_DIR/buckle" --pidfile "$BUCKLE_PIDFILE" >/dev/null 2>&1 & }
+case "$1" in
+  print)     [ -e "$loaded" ] ;;
+  bootstrap) [ -e "$loaded" ] && exit 37; : > "$loaded"; start ;;
+  kickstart) [ -e "$loaded" ] || exit 113
+             pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) && kill "$pid" 2>/dev/null
+             start ;;
+  bootout)   [ -e "$loaded" ] || exit 113; rm -f "$loaded"
+             pid=$(cat "$BUCKLE_PIDFILE" 2>/dev/null) && kill "$pid" 2>/dev/null; exit 0 ;;
+  enable|disable) exit 0 ;;
+esac
+FAKE
+  chmod +x "$TS_TMP/agent-bin/tmux" "$TS_TMP/agent-bin/launchctl"
+  mkdir -p "$TS_TMP/agent-state"
+  agent() {
+    PATH="$TS_TMP/agent-bin:$PATH" TMUXD_SOCKET_ARGS="-L $CFG_SOCK" HOME="$home" \
+      TMUX_CONFIG_DIR="$cfg" BUCKLE_OS=Darwin BUCKLE_LAUNCHCTL="$TS_TMP/agent-bin/launchctl" \
+      AGENT_VERBS="$verbs" AGENT_STATE="$TS_TMP/agent-state" BUCKLE_DIR="$FAKE_BUCKLE_DIR" \
+      bash "$cfg/modules/bucklespring/plugin.sh" "$@"
+  }
+  clear_running; rm -f "$BUCKLE_LAUNCH_LOG" "$verbs"
+
+  agent start default
+  assert_rc0 "agent start: launchd's daemon claims the pidfile" wait_live_count 1
+  assert_eq "agent start: enable, look, bootstrap" \
+    "enable gui/$UID/com.behnam.bucklespring|print gui/$UID/com.behnam.bucklespring|bootstrap gui/$UID $plist" \
+    "$(rg -v '^print' "$verbs" | head -1)|$(rg '^print' "$verbs" | head -1)|$(rg '^bootstrap' "$verbs")"
+  assert_rc0 "agent start: the plist is valid" plutil -lint -s "$plist"
+  assert_contains "agent start: launchd runs the module's daemon with its three paths" "$(cat "$plist")" \
+    "<string>$FAKE_BUCKLE_DIR/buckle</string>"
+  assert_contains "agent start: the settings path rides the plist" "$(cat "$plist")" "<string>$BUCKLE_SETTINGS</string>"
+  assert_contains "agent start: a crash restarts, a clean exit does not" "$(tr -d '\t\n' < "$plist")" \
+    "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"
+  assert_eq "agent start: the manifest's durable row is the rendered plist" "$plist" \
+    "$(HOME="$home"; . "$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh"
+       tmux_plugin_expand_path "$(awk '$1 == "durable" { print $2 }' "$HERE/../plugin.conf")")"
+
+  : > "$verbs"
+  agent start Typewriter
+  assert_rc0 "agent profile: the live daemon is told to reread" wait_hups 1
+  assert_eq "agent profile: launchd is not touched" "" "$(rg -v '^print' "$verbs")"
+
+  : > "$verbs"
+  agent stop
+  assert_rc0 "agent stop: the daemon is gone" wait_live_count 0
+  assert_contains "agent stop: unload" "$(cat "$verbs")" "bootout gui/$UID/com.behnam.bucklespring"
+  assert_contains "agent stop: and stay down at the next login" "$(cat "$verbs")" "disable gui/$UID/com.behnam.bucklespring"
+
+  # A daemon from before the LaunchAgent: intent on, a live holder launchd never loaded.
+  mark_running
+  : > "$verbs"; rm -f "$BUCKLE_LAUNCH_LOG"
+  tmux set -g @buckle_enabled 1
+  "$REAL_TMUX" -L "$CFG_SOCK" set -g @buckle_enabled 1
+  agent restore
+  assert_contains "agent handover: the legacy daemon moves under launchd" "$(cat "$verbs")" "bootstrap gui/$UID $plist"
+  assert_rc0 "agent handover: exactly one daemon survives" wait_live_count 1
+
+  : > "$verbs"
+  agent teardown
+  assert_rc0 "agent teardown: the daemon is gone" wait_live_count 0
+  assert_contains "agent teardown: unload and disable" "$(cat "$verbs")" "disable gui/$UID/com.behnam.bucklespring"
+
+  # Purge through core, which runs the plugin's own purge (unload and disable) before it
+  # deletes the declared caches and the plist, the manifest's `durable` row.
+  printf 'bucklespring off\n' > "$cfg/plugins.conf"; : > "$cfg/plugins.local"
+  gtimeout 2m "$TMUXD_BIN" -L "$CFG_SOCK" state init >/dev/null 2>&1
+  : > "$verbs"
+  PATH="$TS_TMP/agent-bin:$PATH" TMUXD_SOCKET_ARGS="-L $CFG_SOCK" HOME="$home" TMUX_CONFIG_DIR="$cfg" \
+    TMUX_PLUGINS_ROOT="$cfg/modules" TMUX_PLUGINS_CONFIG="$cfg/plugins.conf" \
+    TMUX_PLUGINS_LOCAL="$cfg/plugins.local" BUCKLE_OS=Darwin BUCKLE_LAUNCHCTL="$TS_TMP/agent-bin/launchctl" \
+    AGENT_VERBS="$verbs" AGENT_STATE="$TS_TMP/agent-state" BUCKLE_DIR="$FAKE_BUCKLE_DIR" \
+    "$TMUX_CONFIG_DIR/AI/tmux-plugin-lib.sh" purge bucklespring >/dev/null 2>&1
+  assert_contains "agent purge: the plugin unloads the agent" "$(cat "$verbs")" "disable gui/$UID/com.behnam.bucklespring"
+  assert_rc1 "agent purge: core removes the plist" test -e "$plist"
+
+  # The suite's own server never loaded a checkout: it must not reach launchd at all.
+  : > "$verbs"
+  out=$(PATH="$TS_TMP/agent-bin:$PATH" HOME="$home" BUCKLE_OS=Darwin \
+    BUCKLE_LAUNCHCTL="$TS_TMP/agent-bin/launchctl" AGENT_VERBS="$verbs" AGENT_STATE="$TS_TMP/agent-state" \
+    BUCKLE_DIR="$FAKE_BUCKLE_DIR" TMUXD_SOCKET_ARGS="-L $TS_SOCK" bash "$BUCKLE" start default 2>&1)
+  assert_eq "agent guard: a server that loaded no checkout never reaches launchd" "" "$(cat "$verbs")"
+  assert_contains "agent guard: and says whose it is" "$out" "launchd belongs to the server that loaded"
+  clear_running
+  "$REAL_TMUX" -L "$CFG_SOCK" kill-server 2>/dev/null
+}
+
 test_native_menu_authority
 test_menu_sticky
+test_menu_permission_row
 test_menu_quiet_row
-test_quiet_commit_restarts_running
+test_quiet_commit_signals_running
+test_gain_signals_running
 test_pidfile_start_stop
-test_profile_switch_replaces_daemon
+test_profile_switch_signals_the_daemon
 test_plugin_round_trip_resumes_intent
 test_gain_at_parity
+test_settings_reach_the_binary
+test_claim_is_exclusive
 test_audio_check
 test_restore_starts_enabled
 test_restore_keeps_disabled_off
 test_restore_stops_disabled_running
 test_restore_is_idempotent_when_running
-test_forced_restore_restarts_running
+test_forced_restore_restarts_only_new_code
+test_unattended_build_is_quiet
 test_failed_build_popup_holds_and_preserves_rc
+test_launch_agent
 
 # --- Isolation: this suite never touches the machine's live daemon ------------
 # Twice a sandboxed suite reached bucklespring's reconciler, read no intent from its own

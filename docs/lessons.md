@@ -40,7 +40,9 @@ The rule: on macOS use the DefaultOutput AudioUnit, which CoreAudio keeps on the
 itself, and prove liveness with a render heartbeat rather than a return code. The transition is
 what needs verifying, not the steady state: a probe that reopens onto AirPods already streaming
 succeeds and proves nothing about pairing. `--audio-check` pins the property the bug violated: the
-unit renders, on the device that is the system default.
+unit renders, on the device that is the system default. Reopen only on evidence: the unit is
+rebuilt when its render counter stalls or it is proven off the default device twice running,
+never on a listener's word or a schedule.
 
 ## A generated pkg-config file with an absolute prefix dies with the directory it names
 
@@ -73,3 +75,9 @@ applying, and even `osascript` keystrokes were refused. Nothing in this reposito
 only restarting the terminal, then the tmux server under it, does. What the repository can do is
 tell the truth: the daemon names the state once in its log, the cell reads it and paints orange,
 and the line says which application to restart.
+
+The LaunchAgent is the resolution. A process launchd starts is its own responsible process, so
+buckle's Input Monitoring grant is its own, and no terminal update can revoke it. The grant is
+keyed on the binary's signature, and an ad-hoc signature changes with every build; that is why
+`plugin.sh sign-identity` gives each host one self-signed identity, and why the daemon asks the
+system to list it and keeps retrying rather than exiting into launchd's restart loop.
