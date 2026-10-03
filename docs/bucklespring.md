@@ -41,8 +41,9 @@ is derived from the shared level set in the shell, so only the time comparison e
 
 ## Reconciliation
 
-`init`, `attach`, and `restore` share one reconciler, and the native menu reaches it through
-core's forced apply. It rewrites the settings. With intent on, it launches a stopped daemon,
+`init`, `attach`, and `restore` share one reconciler, and a native menu choice reaches it
+through core's `converge`, which runs the `attach` hook under the plugin lifecycle lock. It
+rewrites the settings. With intent on, it launches a stopped daemon,
 relaunches one whose binary is newer than its claim or whose claim is older than the running
 server, and otherwise signals a changed setting. The second rule exists because a detached
 daemon outlives its server while its grant stays with that server's terminal: after the terminal

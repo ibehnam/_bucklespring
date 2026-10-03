@@ -594,7 +594,7 @@ test_restore_is_idempotent_when_running() {
   clear_running
 }
 
-# A forced convergence (core's apply after every native menu choice) restarts a live
+# A forced convergence (core's apply, as a reload or a plugin switch runs it) restarts a live
 # daemon only for new code: a binary newer than the holder's claim.
 test_forced_restore_restarts_only_new_code() {
   rm -f "$BUCKLE_LAUNCH_LOG"

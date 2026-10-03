@@ -318,8 +318,9 @@ do_quiet_commit() {
 }
 
 # Reconcile persisted intent without interactive UI. Init, attach, and restore share it,
-# and the native menu reaches it through core's forced apply, so it is idempotent and
-# restarts a live daemon only for new code: a settings change is a SIGHUP.
+# and a native menu choice reaches it through core's `converge`, which runs this attach
+# hook, so it is idempotent and restarts a live daemon only for new code: a settings
+# change is a SIGHUP.
 reconcile_intent() {
   local enabled changed=0
   enabled="$(tmux show -gqv @buckle_enabled 2>/dev/null)"
