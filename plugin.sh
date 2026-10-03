@@ -348,7 +348,7 @@ reconcile_intent() {
 do_init() {
   [ -n "$(tmux show -gqv @buckle_quiet_from 2>/dev/null)" ] || tmux set -g @buckle_quiet_from 0
   [ -n "$(tmux show -gqv @buckle_quiet_to 2>/dev/null)" ] || tmux set -g @buckle_quiet_to 0
-  [ -n "$(tmux show -gqv @buckle_enabled 2>/dev/null)" ] || tmux set -g @buckle_enabled 0
+  "$AI_DIR/tmux-plugin-lib.sh" seed-flags bucklespring @buckle_enabled >/dev/null 2>&1 || true
   [ -n "$(tmux show -gqv @buckle_profile 2>/dev/null)" ] || tmux set -g @buckle_profile default
   [ -n "$(tmux show -gqv @buckle_gain 2>/dev/null)" ] || tmux set -g @buckle_gain 100
   # TRANSITIONAL (delete once no live server predates the producer): the retired
