@@ -196,6 +196,15 @@ clear_running() {
 
 settings() { cat "$BUCKLE_SETTINGS" 2>/dev/null; }
 
+# --- The menu's lifecycle path ------------------------------------------------
+# A native menu choice converges through core's `converge`, which runs this
+# plugin's declared attach hook; without the row it would silently do nothing.
+test_menu_choice_has_an_attach_hook() {
+  assert_eq "manifest: converge reaches reconcile_intent through attach" 1 \
+    "$(rg -c '^attach attach$' "$HERE/../plugin.conf")"
+}
+test_menu_choice_has_an_attach_hook
+
 # --- Native authority: one owner enumerates and validates profiles ------------
 test_native_menu_authority() {
   local authority option value profiles="" pidfile="" dir name validation_stderr validation_rc=0
