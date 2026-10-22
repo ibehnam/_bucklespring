@@ -421,33 +421,41 @@ show_menu() {
 }
 
 do_doctor() {
-  local rc=0 stale="" age
+  # One record per check through the shared emitters (AI/tmux-plugin-lib.sh);
+  # the collector reads them and the status daemon's registry keeps them. The
+  # exit status means "finished", never "healthy".
+  local stale="" age
+  # shellcheck source=tmux-plugin-lib.sh
+  . "$AI_DIR/tmux-plugin-lib.sh"
   if [ -x "$BUCKLE_DIR/buckle" ]; then
     stale=$(find "$BUCKLE_DIR" -maxdepth 1 \( -name '*.c' -o -name '*.m' -o -name '*.h' -o -name Makefile \) -newer "$BUCKLE_DIR/buckle" -print -quit 2>/dev/null)
-    [ -z "$stale" ] && printf 'INFO bucklespring: binary is current\n' \
-      || printf 'INFO bucklespring: binary is stale (%s)\n' "$stale"
+    if [ -z "$stale" ]; then
+      tmux_doctor_ok bucklespring.binary "binary is current"
+    else
+      tmux_doctor_info bucklespring.binary "binary is older than its source" --detail "$stale" \
+        --remedy "Rebuild it with make in modules/bucklespring; the fix does that now." --fix make -C modules/bucklespring
+    fi
   else
-    printf 'FAIL bucklespring: binary missing; run make in modules/bucklespring\n'
-    rc=1
+    tmux_doctor_warn bucklespring.binary "binary missing" \
+      --remedy "Build it with make in modules/bucklespring (system frameworks only on macOS); until then no key sounds play." \
+      --fix make -C modules/bucklespring
   fi
   if tmux_daemon_is_live "$BUCKLE_PIDFILE" buckle; then
-    printf 'INFO bucklespring: pidfile holder is live\n'
+    tmux_doctor_ok bucklespring.daemon "pidfile holder is live"
   elif [ -f "$BUCKLE_PIDFILE" ]; then
-    printf 'INFO bucklespring: stale pidfile %s\n' "$BUCKLE_PIDFILE"
+    tmux_doctor_info bucklespring.daemon "stale pidfile" --detail "$BUCKLE_PIDFILE"
   fi
   if [ -f "$BUCKLE_CACHE_DIR/render.hb" ]; then
     age=$(( $(date +%s) - $(tmux_get_mtime "$BUCKLE_CACHE_DIR/render.hb") ))
-    printf 'INFO bucklespring: audio heartbeat %ss old\n' "$age"
+    tmux_doctor_info bucklespring.audio "audio heartbeat ${age}s old"
   fi
   if denied_published; then
-    printf 'FAIL bucklespring: the keyboard tap is refused; grant Input Monitoring to the terminal that started tmux (the menu opens the pane), or restart that terminal if it was updated while running\n'
-    rc=1
+    tmux_doctor_fault bucklespring.input_monitoring "the keyboard tap is refused" \
+      --remedy "Grant Input Monitoring to the terminal that started tmux (the plugin menu's row opens that pane), or restart that terminal if it was updated while running." \
+      --fix modules/bucklespring/plugin.sh open-perms
   fi
-  if [ -f "$BUCKLE_LOG" ]; then
-    printf 'INFO bucklespring: log tail\n'
-    tail -5 "$BUCKLE_LOG"
-  fi
-  return "$rc"
+  [ ! -f "$BUCKLE_LOG" ] || tmux_doctor_info bucklespring.log "log tail" --detail "$(tail -5 "$BUCKLE_LOG" 2>/dev/null | paste -sd'|' -)"
+  return 0
 }
 
 case "${1:-}" in
