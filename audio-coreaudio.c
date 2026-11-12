@@ -199,7 +199,7 @@ static void on_unit_device(void *ref, AudioUnit unit, AudioUnitPropertyID id, Au
 	char buf[256];
 	/* The unit comes from the callback, never the global: a rebuild may be disposing that. */
 	device_name(unit_device(unit), buf, sizeof buf);
-	if (buf[0]) fprintf(stderr, "buckle: output device is now \"%s\"\n", buf);
+	if (buf[0]) note("buckle: output device is now \"%s\"\n", buf);
 }
 
 /* No render thread is running: drop every voice, so a click left over from a stall never
@@ -233,7 +233,7 @@ static void unit_stop(void)
 	OSStatus st;
 
 	if (g_running && (st = AudioOutputUnitStop(g_unit)) != noErr) {
-		fprintf(stderr, "buckle: cannot stop the output unit (%d); disposing of it\n", (int)st);
+		note("buckle: cannot stop the output unit (%d); disposing of it\n", (int)st);
 		unit_destroy();
 		return;
 	}
@@ -248,7 +248,7 @@ static int unit_create(void)
 		kAudioUnitManufacturer_Apple, 0, 0 };
 	AudioComponent comp = AudioComponentFindNext(NULL, &desc);
 	OSStatus st = comp ? AudioComponentInstanceNew(comp, &g_unit) : -1;
-	if (st != noErr || !g_unit) { fprintf(stderr, "buckle: cannot create the output unit (%d)\n", (int)st); g_unit = NULL; return -1; }
+	if (st != noErr || !g_unit) { note("buckle: cannot create the output unit (%d)\n", (int)st); g_unit = NULL; return -1; }
 
 	if (g_pinned)
 		st = AudioUnitSetProperty(g_unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &g_pinned, sizeof g_pinned);
@@ -260,7 +260,7 @@ static int unit_create(void)
 	if (st == noErr) AudioUnitAddPropertyListener(g_unit, kAudioOutputUnitProperty_CurrentDevice, on_unit_device, NULL);
 	if (st == noErr) st = AudioUnitInitialize(g_unit);
 	if (st != noErr) {
-		fprintf(stderr, "buckle: cannot initialise the output unit (%d)\n", (int)st);
+		note("buckle: cannot initialise the output unit (%d)\n", (int)st);
 		unit_destroy();
 		return -1;
 	}
@@ -280,12 +280,12 @@ static void recover(uint64_t now, const char *why)
 	if (now - g_recover_ns < g_recover_gap) return;
 	g_recover_ns = now;
 	g_recover_gap = g_recover_gap < RECOVER_MAX_NS / 2 ? g_recover_gap * 2 : RECOVER_MAX_NS;
-	fprintf(stderr, "buckle: %s; rebuilding the output unit\n", why);
+	note("buckle: %s; rebuilding the output unit\n", why);
 	unit_destroy();
 	if (unit_create() == 0) {
 		char buf[256];
 		device_name(unit_device(g_unit), buf, sizeof buf);
-		fprintf(stderr, "buckle: output unit rebuilt on \"%s\"\n", buf);
+		note("buckle: output unit rebuilt on \"%s\"\n", buf);
 	}
 }
 
@@ -347,7 +347,7 @@ static int output_start(uint64_t now)
 	if (!g_slow_named) {
 		g_slow_named = 1;
 		device_name(unit_device(g_unit), buf, sizeof buf);
-		fprintf(stderr, "buckle: output \"%s\" started %llu ms after its key; a click that late, and the "
+		note("buckle: output \"%s\" started %llu ms after its key; a click that late, and the "
 			"keys queued behind it, are dropped\n", buf, (unsigned long long)(took / 1000000));
 	}
 	g_late_until = uptime_ns() + QUEUED_NS;
@@ -366,15 +366,15 @@ int audio_open(const char *device)
 	g_pinned = kAudioObjectUnknown;
 	if (device) {
 		g_pinned = device_by_name(device);
-		if (g_pinned == kAudioObjectUnknown) { fprintf(stderr, "buckle: no output device named \"%s\"\n", device); return -1; }
+		if (g_pinned == kAudioObjectUnknown) { note("buckle: no output device named \"%s\"\n", device); return -1; }
 	} else if (wanted_device() == kAudioObjectUnknown) {
-		fprintf(stderr, "buckle: no default output device yet; the first click after one appears builds the output\n");
+		note("buckle: no default output device yet; the first click after one appears builds the output\n");
 		return 0;
 	}
 	if (unit_create() != 0) return 0;
 	device_name(unit_device(g_unit), buf, sizeof buf);
-	if (g_pinned) fprintf(stderr, "buckle: output pinned to \"%s\"\n", buf);
-	else          fprintf(stderr, "buckle: output follows the system default (now \"%s\")\n", buf);
+	if (g_pinned) note("buckle: output pinned to \"%s\"\n", buf);
+	else          note("buckle: output follows the system default (now \"%s\")\n", buf);
 	return 0;
 }
 
@@ -394,7 +394,7 @@ int audio_load(const char *path)
 	ExtAudioFileRef file = NULL;
 	OSStatus st = url ? ExtAudioFileOpenURL(url, &file) : -1;
 	if (url) CFRelease(url);
-	if (st != noErr) { fprintf(stderr, "buckle: cannot open \"%s\" (%d)\n", path, (int)st); return 0; }
+	if (st != noErr) { note("buckle: cannot open \"%s\" (%d)\n", path, (int)st); return 0; }
 
 	AudioStreamBasicDescription client = { ENGINE_RATE, kAudioFormatLinearPCM,
 		kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, 4, 1, 4, 1, 32, 0 };
@@ -406,7 +406,7 @@ int audio_load(const char *path)
 	if (st == noErr) st = ExtAudioFileGetProperty(file, kExtAudioFileProperty_FileLengthFrames, &size, &src_frames);
 	if (st == noErr) st = ExtAudioFileSetProperty(file, kExtAudioFileProperty_ClientDataFormat, sizeof client, &client);
 	if (st != noErr || src.mSampleRate <= 0) {
-		fprintf(stderr, "buckle: cannot decode \"%s\" (%d)\n", path, (int)st);
+		note("buckle: cannot decode \"%s\" (%d)\n", path, (int)st);
 		ExtAudioFileDispose(file);
 		return 0;
 	}
@@ -426,7 +426,7 @@ int audio_load(const char *path)
 	}
 	ExtAudioFileDispose(file);
 	if (st != noErr || total == 0) {
-		fprintf(stderr, "buckle: cannot read \"%s\" (%d)\n", path, (int)st);
+		note("buckle: cannot read \"%s\" (%d)\n", path, (int)st);
 		free(pcm);
 		return 0;
 	}
@@ -514,7 +514,7 @@ void audio_monitor(const char *heartbeat_path)
 	g_timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + PARKED_S, MONITOR_S,
 				       0, 0, monitor_tick, NULL);
 	if (!g_timer) {
-		fprintf(stderr, "buckle: cannot create the output timer; a started output never stops\n");
+		note("buckle: cannot create the output timer; a started output never stops\n");
 		return;
 	}
 	CFRunLoopTimerSetTolerance(g_timer, MONITOR_S / 5);   /* let the system coalesce wakeups */

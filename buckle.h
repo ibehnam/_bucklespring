@@ -7,6 +7,7 @@ int play(int code, int press);
 int scan(int verbose);
 void printd(const char *fmt, ...);
 void open_console(void);
+void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   /* one stamped log line */
 
 /*
  * main.c's services to the scanner and the backend. The key thread's timers call pulse(), and

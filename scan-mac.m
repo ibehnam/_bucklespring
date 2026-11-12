@@ -1,6 +1,7 @@
 #include <ApplicationServices/ApplicationServices.h>
 #import <Cocoa/Cocoa.h>
 #include <IOKit/hidsystem/ev_keymap.h>   /* NX_SYSDEFINED, NX_SUBTYPE_AUX_CONTROL_BUTTONS, NX_KEYTYPE_* */
+#include <IOKit/hidsystem/IOLLEvent.h>   /* NX_DEVICE*KEYMASK: each modifier side's own flag bit */
 #include "buckle.h"
 
 #define SCANCODE_SYSDEFINED 0xfe
@@ -152,11 +153,38 @@ static const int mactoset1[] =
 
 /*
  * Modifier keys (shift/ctrl/alt/cmd/capslock) emit kCGEventFlagsChanged, which
- * carries no press/release bit. The global flag mask (kCGEventFlagMaskShift etc.)
- * is unreliable when both L+R of a modifier are held, so we track press state
- * per Mac keycode and toggle on each flagsChanged event.
+ * carries no press/release bit. The generic flag (kCGEventFlagMaskShift etc.) cannot
+ * tell the two sides apart, but each side has its own device bit in the same flags
+ * (IOLLEvent.h), so a press is read from the key's own bit: a toggle per event, as
+ * before, swapped a key's press and release for good after one missed event. A key
+ * without a bit (Caps Lock, Fn) still toggles, and so does an event that sets the
+ * generic flag with neither side's bit, which a synthetic event may.
  */
 static int keystate[128];
+
+static const struct { int keycode; CGEventFlags mine, other, generic; } modifier_bits[] = {
+	{ 0x36, NX_DEVICERCMDKEYMASK,   NX_DEVICELCMDKEYMASK,   kCGEventFlagMaskCommand },
+	{ 0x37, NX_DEVICELCMDKEYMASK,   NX_DEVICERCMDKEYMASK,   kCGEventFlagMaskCommand },
+	{ 0x38, NX_DEVICELSHIFTKEYMASK, NX_DEVICERSHIFTKEYMASK, kCGEventFlagMaskShift },
+	{ 0x3a, NX_DEVICELALTKEYMASK,   NX_DEVICERALTKEYMASK,   kCGEventFlagMaskAlternate },
+	{ 0x3b, NX_DEVICELCTLKEYMASK,   NX_DEVICERCTLKEYMASK,   kCGEventFlagMaskControl },
+	{ 0x3c, NX_DEVICERSHIFTKEYMASK, NX_DEVICELSHIFTKEYMASK, kCGEventFlagMaskShift },
+	{ 0x3d, NX_DEVICERALTKEYMASK,   NX_DEVICELALTKEYMASK,   kCGEventFlagMaskAlternate },
+	{ 0x3e, NX_DEVICERCTLKEYMASK,   NX_DEVICELCTLKEYMASK,   kCGEventFlagMaskControl },
+};
+
+/* Is the modifier MACKEYCODE down after this flagsChanged event? */
+static int modifier_down(int mackeycode, CGEventFlags flags)
+{
+	for (size_t i = 0; i < sizeof modifier_bits / sizeof modifier_bits[0]; i++) {
+		if (modifier_bits[i].keycode != mackeycode) continue;
+		if (flags & modifier_bits[i].mine) return 1;
+		if (!(flags & modifier_bits[i].generic) || (flags & modifier_bits[i].other)) return 0;
+		break;   /* the generic flag alone: no side to read */
+	}
+	return !keystate[mackeycode];
+}
+
 static CFMachPortRef g_tap;
 
 /*
@@ -188,7 +216,7 @@ static void tap_saw_event(void)
 	g_tap_watchdog_hits = 0;
 	if (g_tap_denied) {
 		g_tap_denied = 0;
-		fprintf(stderr, "buckle: event tap receiving events again\n");
+		note("buckle: event tap receiving events again\n");
 	}
 }
 
@@ -197,7 +225,7 @@ static void tap_ensure_enabled(const char *why)
 	if (g_tap && !CGEventTapIsEnabled(g_tap)) {
 		CGEventTapEnable(g_tap, true);
 		if (g_tap_denied) return;   /* already said; keep retrying quietly */
-		fprintf(stderr, "buckle: event tap re-enabled (%s)\n", why);
+		note("buckle: event tap re-enabled (%s)\n", why);
 	}
 }
 
@@ -208,14 +236,14 @@ static void tap_watchdog(CFRunLoopTimerRef timer, void *info)
 	pulse();   /* the key thread runs this timer: it is alive (main.c supervises the pulse) */
 	if (!g_tap) {   /* never created: the grant may have landed since */
 		if (tap_create() == 0)
-			fprintf(stderr, "buckle: event tap created; waiting for the first key\n");
+			note("buckle: event tap created; waiting for the first key\n");
 		return;
 	}
 	if (CGEventTapIsEnabled(g_tap)) return;
 	tap_ensure_enabled("watchdog");
 	if (++g_tap_watchdog_hits >= TAP_DENIED_TICKS && !g_tap_denied) {
 		g_tap_denied = 1;
-		fprintf(stderr, TAP_DENIED_LINE "; no keyboard events are delivered. " TAP_GRANT_HINT "\n");
+		note(TAP_DENIED_LINE "; no keyboard events are delivered. " TAP_GRANT_HINT "\n");
 	}
 }
 
@@ -279,7 +307,7 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 			play(key, 0);
 			break;
 		case kCGEventFlagsChanged: {
-			int press = !keystate[mackeycode];
+			int press = modifier_down(mackeycode, CGEventGetFlags(event));
 			keystate[mackeycode] = press;
 			play(key, press);
 			break;
@@ -340,7 +368,7 @@ int scan(int verbose)
 	 * first key event after a late creation announce recovery. */
 	if (tap_create() != 0) {
 		g_tap_denied = 1;
-		fprintf(stderr, TAP_DENIED_LINE "; the tap could not be created. " TAP_GRANT_HINT "\n");
+		note(TAP_DENIED_LINE "; the tap could not be created. " TAP_GRANT_HINT "\n");
 		if (!CGPreflightListenEventAccess())
 			CGRequestListenEventAccess();
 	}

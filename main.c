@@ -184,6 +184,10 @@ static int snd[512];
 
 
 /*
+ * The log. Every line starts with the local time it was written, "2026-11-12 09:14:03
+ * buckle: …"; the status cell and plugin.sh find their markers anywhere in a line, never at
+ * its start.
+ *
  * Lines from the argv parse (a settings load, a log that would not open) wait until this
  * life's first line, `buckle: started`, is out: the status cell and plugin.sh read that
  * line as the marker that opens a life, and holding them also lands them in this life's
@@ -201,28 +205,94 @@ static void release_held(void)
 	held_len = 0;
 }
 
+/*
+ * "YYYY-MM-DD HH:MM:SS " for NOW in local time, into BUF, by arithmetic alone, so the signal
+ * handlers stamp their lines too: localtime_r is not async-signal-safe, so each ordinary line
+ * refreshes the UTC offset a handler applies. Days to a civil date is Howard Hinnant's
+ * algorithm.
+ */
+#define STAMP_LEN 20
+static _Atomic long utc_offset;
+
+static void stamp(char *buf, time_t now)
+{
+	static const char sep[] = "-- :: ";
+	static const int width[] = { 4, 2, 2, 2, 2, 2 };
+	long t = (long)now + atomic_load_explicit(&utc_offset, memory_order_relaxed);
+	long secs = t % 86400, z = t / 86400 + 719468, era = z / 146097, doe = z - era * 146097;
+	long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	long doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+	long month = mp < 10 ? mp + 3 : mp - 9;
+	long field[] = { yoe + era * 400 + (month <= 2), month, doy - (153 * mp + 2) / 5 + 1,
+			 secs / 3600, secs / 60 % 60, secs % 60 };
+
+	for (int i = 0; i < 6; i++) {
+		for (int k = width[i] - 1; k >= 0; k--, field[i] /= 10)
+			buf[k] = (char)('0' + field[i] % 10);
+		buf += width[i];
+		*buf++ = sep[i];
+	}
+}
+
+/* Learn the UTC offset at NOW, for the stamp: from main and ordinary lines, never a handler. */
+static void stamp_zone(time_t now)
+{
+	struct tm tm;
+
+	if (localtime_r(&now, &tm))
+		atomic_store_explicit(&utc_offset, tm.tm_gmtoff, memory_order_relaxed);
+}
+
+/* One stamped line into LINE, newline-ended even when cut short; its length, 0 for none. */
+static size_t note_format(char *line, size_t size, const char *fmt, va_list va)
+{
+	time_t now = time(NULL);
+	int n;
+
+	stamp_zone(now);
+	stamp(line, now);
+	n = vsnprintf(line + STAMP_LEN, size - STAMP_LEN, fmt, va);
+	if (n <= 0) return 0;
+	if ((size_t)n >= size - STAMP_LEN) {
+		n = (int)(size - STAMP_LEN - 1);
+		line[STAMP_LEN + n - 1] = '\n';
+	}
+	return STAMP_LEN + (size_t)n;
+}
+
 /* One log line: held before the start, straight to stderr after it. */
-static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void say(const char *fmt, ...)
+void note(const char *fmt, ...)
 {
 	char line[PATH_MAX + 256];
 	va_list va;
-	int n;
+	size_t n;
 
 	va_start(va, fmt);
-	n = vsnprintf(line, sizeof line, fmt, va);
+	n = note_format(line, sizeof line, fmt, va);
 	va_end(va);
-	if (n <= 0) return;
-	if ((size_t)n >= sizeof line) {
-		n = sizeof line - 1;
-		line[n - 1] = '\n';
-	}
+	if (!n) return;
 	if (!holding)
-		fwrite(line, 1, (size_t)n, stderr);
-	else if (held_len + (size_t)n <= sizeof held) {
-		memcpy(held + held_len, line, (size_t)n);
-		held_len += (size_t)n;
+		fwrite(line, 1, n, stderr);
+	else if (held_len + n <= sizeof held) {
+		memcpy(held + held_len, line, n);
+		held_len += n;
 	}
+}
+
+/* One log line written at once, ahead of the held ones: a life's opening lines, or the
+ * claim's refusal, which goes to the inherited stderr. */
+static void note_now(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void note_now(const char *fmt, ...)
+{
+	char line[PATH_MAX + 256];
+	va_list va;
+	size_t n;
+
+	va_start(va, fmt);
+	n = note_format(line, sizeof line, fmt, va);
+	va_end(va);
+	if (n)
+		fwrite(line, 1, n, stderr);
 }
 
 
@@ -241,18 +311,18 @@ static void log_to(const char *path)
 	if (lstat(path, &st) == 0 && S_ISREG(st.st_mode)) {
 		n = snprintf(old, sizeof old, "%s.1", path);
 		if (n < 0 || (size_t)n >= sizeof old)
-			say("buckle: cannot keep the previous log of %s: %s\n", path, strerror(ENAMETOOLONG));
+			note("buckle: cannot keep the previous log of %s: %s\n", path, strerror(ENAMETOOLONG));
 		else if (rename(path, old) != 0)
-			say("buckle: cannot keep the previous log as %s: %s\n", old, strerror(errno));
+			note("buckle: cannot keep the previous log as %s: %s\n", old, strerror(errno));
 	}
 	fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
 	if (fd < 0) {
-		say("buckle: cannot open the log %s: %s; logging to the inherited stderr\n", path, strerror(errno));
+		note("buckle: cannot open the log %s: %s; logging to the inherited stderr\n", path, strerror(errno));
 		return;
 	}
 	if (fd != STDERR_FILENO) {
 		if (dup2(fd, STDERR_FILENO) < 0) {
-			say("buckle: cannot log to %s: %s; logging to the inherited stderr\n", path, strerror(errno));
+			note("buckle: cannot log to %s: %s; logging to the inherited stderr\n", path, strerror(errno));
 			close(fd);
 			return;
 		}
@@ -304,23 +374,23 @@ static int pidfile_claim(const char *path)
 	int fd, n, err;
 
 	if (strlen(path) >= sizeof claimed_path) {
-		fprintf(stderr, "buckle: cannot claim %s: %s\n", path, strerror(ENAMETOOLONG));
+		note_now("buckle: cannot claim %s: %s\n", path, strerror(ENAMETOOLONG));
 		return EXIT_FAILURE;
 	}
 	for (int attempt = 0; attempt < CLAIM_ATTEMPTS; attempt++) {
 		fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
 		if (fd < 0) {
-			fprintf(stderr, "buckle: cannot claim %s: %s\n", path, strerror(errno));
+			note_now("buckle: cannot claim %s: %s\n", path, strerror(errno));
 			return EXIT_FAILURE;
 		}
 		if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
 			err = errno;
 			close(fd);
 			if (err == EWOULDBLOCK) {
-				fprintf(stderr, "buckle: another holder owns %s; exiting\n", path);
+				note_now("buckle: another holder owns %s; exiting\n", path);
 				return EX_TEMPFAIL;
 			}
-			fprintf(stderr, "buckle: cannot claim %s: %s\n", path, strerror(err));
+			note_now("buckle: cannot claim %s: %s\n", path, strerror(err));
 			return EXIT_FAILURE;
 		}
 		if (fstat(fd, &mine) != 0 || stat(path, &named) != 0
@@ -340,13 +410,13 @@ static int pidfile_claim(const char *path)
 		else if ((w = pwrite(fd, pid, (size_t)n, 0)) != n)
 			err = w < 0 ? errno : EIO;
 		if (err) {
-			fprintf(stderr, "buckle: cannot write %s: %s\n", path, strerror(err));
+			note_now("buckle: cannot write %s: %s\n", path, strerror(err));
 			pidfile_release();
 			return EXIT_FAILURE;
 		}
 		return 0;
 	}
-	fprintf(stderr, "buckle: %s was replaced %d times during the claim; giving up\n", path, CLAIM_ATTEMPTS);
+	note_now("buckle: %s was replaced %d times during the claim; giving up\n", path, CLAIM_ATTEMPTS);
 	return EXIT_FAILURE;
 }
 
@@ -383,7 +453,8 @@ static bool pidfile_in_home(const char *path)
  * green, so TERM (a Stop, a teardown, a stray kill) and INT end the life with a line naming
  * them, and remove the pidfile they hold. KILL and a crash stay silent, and a crash writes
  * its own report. HUP no longer ends anything: it asks for the settings file again, which
- * play() rereads at the next key event. The handlers use only async-signal-safe calls.
+ * play() rereads at the next key event. The handlers use only async-signal-safe calls,
+ * stamp() included.
  */
 static volatile sig_atomic_t reload_requested;
 
@@ -391,9 +462,13 @@ static void on_stop(int sig)
 {
 	static const char term[] = "buckle: terminated by SIGTERM\n";
 	static const char intr[] = "buckle: terminated by SIGINT\n";
+	const char *why = sig == SIGTERM ? term : intr;
+	size_t len = sig == SIGTERM ? sizeof term - 1 : sizeof intr - 1;
+	char line[STAMP_LEN + sizeof term];
 
-	if (sig == SIGTERM) (void)!write(STDERR_FILENO, term, sizeof term - 1);
-	else                (void)!write(STDERR_FILENO, intr, sizeof intr - 1);
+	stamp(line, time(NULL));
+	memcpy(line + STAMP_LEN, why, len);
+	(void)!write(STDERR_FILENO, line, STAMP_LEN + len);
 	pidfile_release();
 	_exit(sig == SIGTERM ? 0 : 130);
 }
@@ -506,7 +581,7 @@ static bool settings_load(const char *path)
 	FILE *f = fopen(path, "r");
 
 	if (!f) {
-		say("buckle: settings: cannot read %s: %s; keeping the current values\n", path, strerror(errno));
+		note("buckle: settings: cannot read %s: %s; keeping the current values\n", path, strerror(errno));
 		return false;
 	}
 	snprintf(before, sizeof before, "%s", opt_path_audio);
@@ -515,7 +590,7 @@ static bool settings_load(const char *path)
 
 		lineno++;
 		if (rc < 0) {
-			say("buckle: settings: line %d is too long or not text; ignored\n", lineno);
+			note("buckle: settings: line %d is too long or not text; ignored\n", lineno);
 			continue;
 		}
 		len = strlen(line);
@@ -524,7 +599,7 @@ static bool settings_load(const char *path)
 			;
 		if (*p == '\0' || *p == '#') continue;
 		if (!(value = strchr(line, '='))) {
-			say("buckle: settings: line %d is not KEY=VALUE; ignored\n", lineno);
+			note("buckle: settings: line %d is not KEY=VALUE; ignored\n", lineno);
 			continue;
 		}
 		*value++ = '\0';
@@ -535,24 +610,24 @@ static bool settings_load(const char *path)
 			if (parse_int(value, 0, ints[i].max, &v))
 				*ints[i].value = v;
 			else
-				say("buckle: settings: line %d: %s must be a whole number 0..%d; keeping %d\n",
+				note("buckle: settings: line %d: %s must be a whole number 0..%d; keeping %d\n",
 				    lineno, ints[i].key, ints[i].max, *ints[i].value);
 		} else if (strcmp(key, "profile") == 0) {
 			if (!profile_path(value, dir, sizeof dir))
-				say("buckle: settings: line %d: profile is not a sound-pack name; keeping %s\n",
+				note("buckle: settings: line %d: profile is not a sound-pack name; keeping %s\n",
 				    lineno, profile_name());
 			else if (strcmp(dir, opt_path_audio) != 0) {
 				memcpy(profile_dir, dir, strlen(dir) + 1);
 				opt_path_audio = profile_dir;
 			}
 		} else {
-			say("buckle: settings: line %d: unknown key; ignored\n", lineno);
+			note("buckle: settings: line %d: unknown key; ignored\n", lineno);
 		}
 	}
 	if (ferror(f))   /* errno is still the failed read's: nothing has run since it */
-		say("buckle: settings: cannot read all of %s: %s; kept the lines before it\n", path, strerror(errno));
+		note("buckle: settings: cannot read all of %s: %s; kept the lines before it\n", path, strerror(errno));
 	fclose(f);
-	say("buckle: settings: gain %d, quiet %d-%d at %d, profile %s\n",
+	note("buckle: settings: gain %d, quiet %d-%d at %d, profile %s\n",
 	    opt_gain, opt_quiet_from, opt_quiet_to, opt_quiet_gain, profile_name());
 	return strcmp(before, opt_path_audio) != 0;
 }
@@ -565,7 +640,7 @@ static bool settings_load(const char *path)
 static void settings_reload(void)
 {
 	if (!opt_settings) {
-		say("buckle: SIGHUP without --settings; nothing to reload\n");
+		note("buckle: SIGHUP without --settings; nothing to reload\n");
 		return;
 	}
 	if (settings_load(opt_settings)) {
@@ -603,7 +678,7 @@ void output_stalled(unsigned cause, const char *why)
 	pthread_mutex_lock(&stall_lock);
 	if (!(stall_causes & cause)) {
 		stall_causes |= cause;
-		say("buckle: output stalled: %s\n", why);
+		note("buckle: output stalled: %s\n", why);
 	}
 	pthread_mutex_unlock(&stall_lock);
 }
@@ -614,7 +689,7 @@ void output_recovered(unsigned cause)
 	if (stall_causes & cause) {
 		stall_causes &= ~cause;
 		if (!stall_causes)
-			say("buckle: output recovered\n");
+			note("buckle: output recovered\n");
 	}
 	pthread_mutex_unlock(&stall_lock);
 }
@@ -655,7 +730,7 @@ static void *identity_watch(void *arg)
 		if (mine == 1)
 			losses = 0;
 		else if (mine == 0 && ++losses >= CLAIM_LOSSES) {
-			say("buckle: %s no longer names this daemon; exiting\n", claimed_path);
+			note("buckle: %s no longer names this daemon; exiting\n", claimed_path);
 			_exit(EXIT_FAILURE);
 		}
 		last = atomic_load_explicit(&pulse_ns, memory_order_relaxed);
@@ -685,7 +760,7 @@ static void identity_watch_start(void)
 	err = pthread_create(&thread, NULL, identity_watch, NULL);
 	pthread_sigmask(SIG_SETMASK, &old, NULL);
 	if (err) {
-		say("buckle: cannot start the identity watch: %s; running without it\n", strerror(err));
+		note("buckle: cannot start the identity watch: %s; running without it\n", strerror(err));
 		return;
 	}
 	pthread_detach(thread);
@@ -823,7 +898,7 @@ int main(int argc, char **argv)
 	}
 
 	if (opt_claim_only && !opt_pidfile) {
-		say("buckle: --claim-only needs --pidfile\n");
+		note("buckle: --claim-only needs --pidfile\n");
 		return 2;
 	}
 
@@ -835,6 +910,7 @@ int main(int argc, char **argv)
 	 * line on the inherited stderr and the holder's log where it was. The handlers go
 	 * first, so a TERM during the claim still ends it. Only then is the log moved aside
 	 * and opened, so `started` is the first line of the fresh one. */
+	stamp_zone(time(NULL));
 	install_signals();
 	if (opt_pidfile && (rv = pidfile_claim(opt_pidfile)) != 0) {
 		held_len = 0;   /* no life started: its parse-time lines are dropped, not released */
@@ -843,12 +919,12 @@ int main(int argc, char **argv)
 	if (opt_log)
 		log_to(opt_log);
 
-	fprintf(stderr, "buckle: started, pid %ld\n", (long)getpid());
+	note_now("buckle: started, pid %ld\n", (long)getpid());
 
 	if (opt_claim_only) {
-		fprintf(stderr, "buckle: claim-only; holding %s\n", opt_pidfile);
+		note_now("buckle: claim-only; holding %s\n", opt_pidfile);
 	} else if (opt_pidfile && !pidfile_in_home(opt_pidfile)) {
-		fprintf(stderr, "buckle: %s is outside the account's home; "
+		note_now("buckle: %s is outside the account's home; "
 			"holding the claim without the keyboard or the speakers\n", opt_pidfile);
 		opt_claim_only = 1;
 	}
@@ -883,7 +959,7 @@ int main(int argc, char **argv)
 	printd("Using wav dir: \"%s\"\n", opt_path_audio);
 
 	scan(opt_verbose);
-	fprintf(stderr, "buckle: event-tap run loop ended; exiting\n");
+	note("buckle: event-tap run loop ended; exiting\n");
 	pidfile_release();
 	rv = EXIT_FAILURE;
 
@@ -1060,8 +1136,10 @@ int play(int code, int press)
 
 	printd("scancode %d/0x%x", code, code);
 
-	/* Scanner couldn't map this physical key (e.g. Fn/Globe on mac) — drop silently. */
-	if (code == 0) return 0;
+	/* A key the scanner could not map (code 0: Fn/Globe on a Mac), or a code past the 256 a
+	 * sample table holds (Linux's evdev codes run to 767): drop it silently, before the
+	 * mute check, so a mute key of 0 never fires. */
+	if (code <= 0 || code > 255) return 0;
 
 	if (code == 0xff && opt_no_click) return 0;
 
