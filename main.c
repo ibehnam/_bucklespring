@@ -16,6 +16,7 @@
 #include <stdatomic.h>
 #include <sysexits.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 
@@ -347,6 +348,33 @@ static int pidfile_claim(const char *path)
 	}
 	fprintf(stderr, "buckle: %s was replaced %d times during the claim; giving up\n", path, CLAIM_ATTEMPTS);
 	return EXIT_FAILURE;
+}
+
+/*
+ * The keyboard and the speakers belong to the account: a daemon opens them only for a
+ * pidfile under the account's home, so a test sandbox's daemon, whose pidfile sits under the
+ * temporary directory, holds its claim inert. The home comes from the password database,
+ * never $HOME, which a sandbox rewrites, and an unknown home fails closed. Whole path
+ * components are compared as text, with no realpath, so a symlinked ~/.cache still counts;
+ * a relative path is first joined to the working directory.
+ */
+static bool pidfile_in_home(const char *path)
+{
+	struct passwd *pw = getpwuid(getuid());
+	char cwd[PATH_MAX], joined[PATH_MAX];
+	size_t n;
+	int len;
+
+	if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/') return false;
+	if (path[0] != '/') {
+		if (!getcwd(cwd, sizeof cwd)) return false;
+		len = snprintf(joined, sizeof joined, "%s/%s", cwd, path);
+		if (len < 0 || (size_t)len >= sizeof joined) return false;
+		path = joined;
+	}
+	n = strlen(pw->pw_dir);
+	while (n > 0 && pw->pw_dir[n - 1] == '/') n--;   /* "/home/me/" is "/home/me"; "/" is "" */
+	return strncmp(path, pw->pw_dir, n) == 0 && path[n] == '/';
 }
 
 
@@ -753,8 +781,13 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "buckle: started, pid %ld\n", (long)getpid());
 
-	if (opt_claim_only)
+	if (opt_claim_only) {
 		fprintf(stderr, "buckle: claim-only; holding %s\n", opt_pidfile);
+	} else if (opt_pidfile && !pidfile_in_home(opt_pidfile)) {
+		fprintf(stderr, "buckle: %s is outside the account's home; "
+			"holding the claim without the keyboard or the speakers\n", opt_pidfile);
+		opt_claim_only = 1;
+	}
 	release_held();
 	identity_watch_start();
 	if (opt_claim_only)
