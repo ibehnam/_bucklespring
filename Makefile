@@ -30,7 +30,8 @@ else
   SRC     += scan-mac.m audio-coreaudio.c
  else
   BIN     := $(NAME)
-  LIBS    += -lm
+  LIBS    += -lm -pthread
+  CFLAGS  += -pthread
   ifdef libinput
    LIBS    += $(shell pkg-config --libs openal alure libinput libudev)
    CFLAGS  += $(shell pkg-config --cflags openal alure libinput libudev)

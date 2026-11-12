@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <sysexits.h>
+#include <pthread.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 
@@ -274,14 +275,22 @@ static void log_to(const char *path)
 static char claimed_path[PATH_MAX];              /* read by the signal handlers */
 static volatile sig_atomic_t claimed_fd = -1;    /* the locked descriptor, once claimed */
 
-/* Async-signal-safe: fstat, stat and unlink only. */
-static void pidfile_release(void)
+/* Does the claimed path still name the inode this daemon locked? 1 yes; 0 provably not,
+ * because the path is gone (ENOENT) or names another file; -1 unknown, from any other
+ * error. Async-signal-safe: fstat and stat only. */
+static int pidfile_mine(void)
 {
 	struct stat mine, named;
 
-	if (claimed_fd < 0) return;
-	if (fstat(claimed_fd, &mine) == 0 && stat(claimed_path, &named) == 0
-	    && mine.st_dev == named.st_dev && mine.st_ino == named.st_ino)
+	if (claimed_fd < 0 || fstat(claimed_fd, &mine) != 0) return -1;
+	if (stat(claimed_path, &named) != 0) return errno == ENOENT ? 0 : -1;
+	return mine.st_dev == named.st_dev && mine.st_ino == named.st_ino;
+}
+
+/* Async-signal-safe: removes the pidfile only while it still names this daemon. */
+static void pidfile_release(void)
+{
+	if (pidfile_mine() == 1)
 		unlink(claimed_path);
 }
 
@@ -537,6 +546,80 @@ static void settings_reload(void)
 	}
 }
 
+/*
+ * The identity watch. A daemon whose pidfile is gone is an orphan that no Stop can reach:
+ * two test daemons whose sandbox was removed kept clicking until a reboot. So once the life
+ * has started, a thread looks at the claim every second. Only a path that is gone (ENOENT)
+ * or names another inode counts as losing it, any other error is unknown and changes
+ * nothing, and two losses in a row end the life with a line saying why
+ * (docs/lessons/daemons/identity.md). The thread runs with TERM, INT, and HUP blocked, so
+ * they stay on the main thread, whose handlers and waits expect them.
+ */
+#define WATCH_S      1   /* the identity watch's period, seconds */
+#define CLAIM_LOSSES 2   /* consecutive losses of the claim that end the life */
+
+static void *identity_watch(void *arg)
+{
+	int losses = 0, mine;
+
+	(void)arg;
+	for (;;) {
+		sleep(WATCH_S);
+		mine = pidfile_mine();
+		if (mine == 1)
+			losses = 0;
+		else if (mine == 0 && ++losses >= CLAIM_LOSSES) {
+			say("buckle: %s no longer names this daemon; exiting\n", claimed_path);
+			_exit(EXIT_FAILURE);
+		}
+	}
+	return NULL;
+}
+
+/* Start the identity watch beside a claim; a daemon that cannot says so and runs without it. */
+static void identity_watch_start(void)
+{
+	sigset_t block, old;
+	pthread_t thread;
+	int err;
+
+	if (claimed_fd < 0) return;
+	sigemptyset(&block);
+	sigaddset(&block, SIGTERM);
+	sigaddset(&block, SIGINT);
+	sigaddset(&block, SIGHUP);
+	pthread_sigmask(SIG_BLOCK, &block, &old);
+	err = pthread_create(&thread, NULL, identity_watch, NULL);
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+	if (err) {
+		say("buckle: cannot start the identity watch: %s; running without it\n", strerror(err));
+		return;
+	}
+	pthread_detach(thread);
+}
+
+/*
+ * Hold the claim with no audio and no keys: the test suite's --claim-only seam. TERM and
+ * INT end it through their handlers, and HUP rereads the settings file. HUP stays blocked
+ * outside sigsuspend, so one that lands during a reread waits for the next pass.
+ */
+static void hold_claim(void) __attribute__((noreturn));
+static void hold_claim(void)
+{
+	sigset_t hup, suspend_mask;
+
+	sigemptyset(&hup);
+	sigaddset(&hup, SIGHUP);
+	pthread_sigmask(SIG_BLOCK, &hup, &suspend_mask);
+	sigdelset(&suspend_mask, SIGHUP);
+	for (;;) {
+		while (!reload_requested)
+			sigsuspend(&suspend_mask);
+		reload_requested = 0;
+		settings_reload();
+	}
+}
+
 /* <dirname of the pidfile>/render.hb, the audio heartbeat beside the identity it belongs to. */
 static const char *heartbeat_path(char *buf, size_t size)
 {
@@ -670,15 +753,12 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "buckle: started, pid %ld\n", (long)getpid());
 
-	if (opt_claim_only) {
-		/* The test suite's seam: this identity and these signals, with no audio and no
-		 * tap. TERM and INT end it through their handlers; HUP only interrupts pause(). */
+	if (opt_claim_only)
 		fprintf(stderr, "buckle: claim-only; holding %s\n", opt_pidfile);
-		release_held();
-		for (;;)
-			pause();
-	}
 	release_held();
+	identity_watch_start();
+	if (opt_claim_only)
+		hold_claim();
 
 	/* Path to data files can also be specified by environment, this is
 	 * used by the snap package */
@@ -749,7 +829,8 @@ static void usage(char *exe)
 		"      --settings=PATH       read KEY=VALUE lines: gain, quiet_from, quiet_to,\n"
 		"                            quiet_gain, and profile (default, or a directory under\n"
 		"                            ./wav-klack); SIGHUP rereads PATH at the next key\n"
-		"      --claim-only          claim --pidfile and wait for a signal: no audio, no keys\n",
+		"      --claim-only          claim --pidfile and hold it: no audio, no keys; SIGHUP\n"
+		"                            rereads --settings\n",
 		exe
        );
 }
