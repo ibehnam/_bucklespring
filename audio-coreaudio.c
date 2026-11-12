@@ -227,17 +227,18 @@ static void unit_destroy(void)
 
 /* Stop the unit: no render thread, no sleep assertion, no timer. AudioOutputUnitStop returns
  * only once the render callback is not running. A stop that fails disposes of the unit,
- * which ends its render thread just the same; the next click builds another. */
-static void unit_stop(void)
+ * which ends its render thread just the same, and returns -1; the next click builds another. */
+static int unit_stop(void)
 {
 	OSStatus st;
 
 	if (g_running && (st = AudioOutputUnitStop(g_unit)) != noErr) {
 		note("buckle: cannot stop the output unit (%d); disposing of it\n", (int)st);
 		unit_destroy();
-		return;
+		return -1;
 	}
 	output_idle();
+	return 0;
 }
 
 /* Build and initialise the unit, stopped. DefaultOutput unless a device was pinned with -d. */
@@ -306,31 +307,13 @@ static AudioDeviceID wanted_device(void)
 	return want;
 }
 
-/*
- * Start the unit for a click, rebuilding it first when it is missing or sits off the default
- * device: a stopped unit is never trusted to have followed a device change. 0 when the click
- * may play. A start that takes longer than LATE_NS delivers its click too late, and the keys
- * typed during it queue behind it and arrive within QUEUED_NS, so all of them are dropped: the
- * rule engages only after a measured slow start, so it can never silence a fast device, and it
- * reads no clock but this daemon's. Such a device is named once per life.
- */
-static int output_start(uint64_t now)
+/* Start the built unit and arm the timer; a start that fails is a stall and disposes of the
+ * unit, so the next click rebuilds it. 0 once it runs. */
+static int unit_start(void)
 {
-	AudioDeviceID want = wanted_device();
-	uint64_t took;
-	OSStatus st;
-	char why[64], buf[256];
+	OSStatus st = AudioOutputUnitStart(g_unit);
+	char why[64];
 
-	if (g_unit && !g_pinned && want != kAudioObjectUnknown && unit_device(g_unit) != want)
-		recover(now, "the output unit is not on the default device");
-	if (!g_unit)
-		recover(now, "the output unit is missing");
-	if (!g_unit) {
-		output_stalled(STALL_AUDIO, want == kAudioObjectUnknown ? "no output device" : "no output unit");
-		return -1;
-	}
-	st = AudioOutputUnitStart(g_unit);
-	took = uptime_ns() - now;
 	if (st != noErr) {
 		snprintf(why, sizeof why, "cannot start the output unit (%d)", (int)st);
 		output_stalled(STALL_AUDIO, why);
@@ -343,15 +326,54 @@ static int output_start(uint64_t now)
 	g_follow_misses = 0;
 	if (g_timer)
 		CFRunLoopTimerSetNextFireDate(g_timer, CFAbsoluteTimeGetCurrent() + MONITOR_S);
-	if (took <= LATE_NS) return 0;
-	if (!g_slow_named) {
+	return 0;
+}
+
+/*
+ * Start the unit for a click that arrived at NOW, rebuilding it first when it is missing or
+ * sits off the default device: a stopped unit is never trusted to have followed a device
+ * change. 0 when the click may play. A click whose unit became ready over LATE_NS after it
+ * arrived plays too late, and the keys typed meanwhile queue behind it and arrive within
+ * QUEUED_NS, so all of them are dropped: the rule engages only after a measured delay, so it
+ * can never silence a fast device, and it reads no clock but this daemon's. A device whose
+ * start alone took that long, rather than a rebuild before it, is named once per life.
+ */
+static int output_start(uint64_t now)
+{
+	AudioDeviceID want = wanted_device();
+	uint64_t t, started;
+	char buf[256];
+
+	if (g_unit && !g_pinned && want != kAudioObjectUnknown && unit_device(g_unit) != want)
+		recover(now, "the output unit is not on the default device");
+	if (!g_unit)
+		recover(now, "the output unit is missing");
+	if (!g_unit) {
+		output_stalled(STALL_AUDIO, want == kAudioObjectUnknown ? "no output device" : "no output unit");
+		return -1;
+	}
+	t = uptime_ns();
+	if (unit_start() != 0) return -1;
+	started = uptime_ns() - t;
+	if (uptime_ns() - now <= LATE_NS) return 0;
+	if (started > LATE_NS && !g_slow_named) {
 		g_slow_named = 1;
 		device_name(unit_device(g_unit), buf, sizeof buf);
-		note("buckle: output \"%s\" started %llu ms after its key; a click that late, and the "
-			"keys queued behind it, are dropped\n", buf, (unsigned long long)(took / 1000000));
+		note("buckle: output \"%s\" took %llu ms to start; a click that late, and the keys "
+			"queued behind it, are dropped\n", buf, (unsigned long long)(started / 1000000));
 	}
 	g_late_until = uptime_ns() + QUEUED_NS;
 	return -1;
+}
+
+/* Rebuild a unit that clicks are using, and start the new one at once: the tick can then prove
+ * it renders and write the recovery, whether or not anyone types again, and the idle stop still
+ * ends it 30 s after the last click. A rebuild the backoff holds back changes nothing. */
+static void rebuild_running(uint64_t now, const char *why)
+{
+	recover(now, why);
+	if (g_unit && !g_running)
+		unit_start();
 }
 
 /*
@@ -443,12 +465,16 @@ int audio_load(const char *path)
 /*
  * A new sound pack: drop every decoded sample, so main.c reloads them lazily from the new
  * directory. The render thread reads sample PCM through PLAYING voices, so the unit stops
- * first, which clears them; the next click starts it again.
+ * first, which clears them; the next click starts it again. After a stop that failed, the old
+ * PCM stays allocated rather than freed under a render thread the dispose may not have ended.
  */
 void audio_forget_samples(void)
 {
-	unit_stop();
-	for (int i = 1; i <= nsamples; i++) {
+	int stopped = unit_stop() == 0;
+
+	if (!stopped)
+		note("buckle: keeping the old samples in memory after a failed stop\n");
+	for (int i = 1; i <= nsamples && stopped; i++) {
 		free(samples[i].pcm);
 		samples[i].pcm = NULL;
 		samples[i].frames = 0;
@@ -479,13 +505,13 @@ static void monitor_tick(CFRunLoopTimerRef timer, void *info)
 	} else if (now - g_seen_ns > STALL_NS) {
 		g_seen_ns = now;
 		output_stalled(STALL_AUDIO, "no render callback for 1.5 s");
-		recover(now, "the output stalled");
+		rebuild_running(now, "the output stalled");
 		return;
 	}
 
 	/* Follow check: the DefaultOutput unit moves itself, but prove it. Two consecutive ticks
 	 * that find it off the default device mean the internal switch did not land; a fresh
-	 * unit binds to the current default at the next click. */
+	 * unit binds to the current default. */
 	if (!g_pinned) {
 		AudioDeviceID want = wanted_device(), have = unit_device(g_unit);
 		on_default = want == kAudioObjectUnknown || have == want;
@@ -493,7 +519,7 @@ static void monitor_tick(CFRunLoopTimerRef timer, void *info)
 			g_follow_misses = 0;
 		} else if (++g_follow_misses >= 2) {
 			g_follow_misses = 0;
-			recover(now, "the output unit is not on the default device");
+			rebuild_running(now, "the output unit is not on the default device");
 			return;
 		}
 	}
@@ -577,12 +603,12 @@ int audio_check(const char *device)
 	device_name(unit_device(g_unit), have, sizeof have);
 	device_name(device ? g_pinned : default_output(), want, sizeof want);
 	t = uptime_ns();
-	unit_stop();
+	int clean = unit_stop() == 0;   /* a stop that had to dispose of the unit fails the check */
 	stopped = uptime_ns() - t;
 	after = atomic_load(&g_renders);
 	usleep(100000);
 	after = atomic_load(&g_renders) - after;
-	int ok = renders > 0 && after == 0 && !g_running && strcmp(have, want) == 0;
+	int ok = renders > 0 && after == 0 && clean && strcmp(have, want) == 0;
 	printf("device=\"%s\" expected=\"%s\" renders=%llu start=%llums stop=%llums renders-after-stop=%llu %s\n",
 	       have, want, (unsigned long long)renders, (unsigned long long)(started / 1000000),
 	       (unsigned long long)(stopped / 1000000), (unsigned long long)after, ok ? "ok" : "FAIL");

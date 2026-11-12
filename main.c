@@ -426,12 +426,14 @@ static int pidfile_claim(const char *path)
  * temporary directory, holds its claim inert. The home comes from the password database,
  * never $HOME, which a sandbox rewrites, and an unknown home fails closed. Whole path
  * components are compared as text, with no realpath, so a symlinked ~/.cache still counts;
- * a relative path is first joined to the working directory.
+ * a relative path is first joined to the working directory, which getcwd gives with its
+ * symlinks resolved. A `..` component could climb out of the home, so it fails closed too.
  */
 static bool pidfile_in_home(const char *path)
 {
 	struct passwd *pw = getpwuid(getuid());
 	char cwd[PATH_MAX], joined[PATH_MAX];
+	const char *up;
 	size_t n;
 	int len;
 
@@ -442,6 +444,8 @@ static bool pidfile_in_home(const char *path)
 		if (len < 0 || (size_t)len >= sizeof joined) return false;
 		path = joined;
 	}
+	for (up = strstr(path, "/.."); up; up = strstr(up + 1, "/.."))
+		if (up[3] == '/' || up[3] == '\0') return false;
 	n = strlen(pw->pw_dir);
 	while (n > 0 && pw->pw_dir[n - 1] == '/') n--;   /* "/home/me/" is "/home/me"; "/" is "" */
 	return strncmp(path, pw->pw_dir, n) == 0 && path[n] == '/';
@@ -721,11 +725,15 @@ void pulse(void)
 static void *identity_watch(void *arg)
 {
 	int losses = 0, mine;
+	unsigned ticks = 0;
 	uint64_t last;
 
 	(void)arg;
 	for (;;) {
 		sleep(WATCH_S);
+		if (ticks++ % 60 == 0)
+			stamp_zone(time(NULL));   /* an idle daemon logs nothing, so a handler's stamp
+						   * would keep a UTC offset from before a DST change */
 		mine = pidfile_mine();
 		if (mine == 1)
 			losses = 0;
@@ -950,7 +958,6 @@ int main(int argc, char **argv)
 	 * plugin's reconciler starts a new life at the next attach. */
 
 	if (audio_open(opt_device) != 0) {
-		pidfile_release();
 		rv = EXIT_FAILURE;
 		goto out;
 	}
@@ -960,11 +967,13 @@ int main(int argc, char **argv)
 
 	scan(opt_verbose);
 	note("buckle: event-tap run loop ended; exiting\n");
-	pidfile_release();
 	rv = EXIT_FAILURE;
 
 out:
+	/* The claim goes last: released earlier, a slow close would let the identity watch
+	 * name a lost claim as this exit's cause. */
 	audio_close();
+	pidfile_release();
 
 	return rv;
 }
@@ -1134,7 +1143,7 @@ int play(int code, int press)
 		settings_reload();
 	}
 
-	printd("scancode %d/0x%x", code, code);
+	printd("scancode %d/0x%x %s", code, code, press ? "press" : "release");
 
 	/* A key the scanner could not map (code 0: Fn/Globe on a Mac), or a code past the 256 a
 	 * sample table holds (Linux's evdev codes run to 767): drop it silently, before the

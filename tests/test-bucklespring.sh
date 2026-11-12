@@ -673,6 +673,20 @@ test_unanswered_preferences_change_nothing() {
   clear_running
 }
 
+# Intent on with no daemon is the doctor's warning, carrying the plugin log's last lines, and
+# a host with no plugin log at all (a fresh cache) must still get every record: a bare tail of
+# the missing file once ended the doctor under `set -e` right after its first record.
+test_doctor_warns_with_no_plugin_log() {
+  local out rc=0 tab=$'\t'
+  clear_running
+  tmux set -g @buckle_enabled 1
+  rm -f "$XDG_CACHE_HOME/tmux/plugin-bucklespring.log"
+  out=$(TMUX_DOCTOR_RECORDS=1 BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" doctor 2>&1) || rc=$?
+  assert_eq "buckle doctor: finishes with no plugin log" 0 "$rc"
+  assert_contains "buckle doctor: intent on with no daemon is a warning" "$out" \
+    "warn${tab}bucklespring.daemon${tab}bucklespring${tab}key sounds are on, but no daemon runs"
+}
+
 test_restore_is_idempotent_when_running() {
   rm -f "$BUCKLE_LAUNCH_LOG"
   mark_running
@@ -787,6 +801,7 @@ test_restore_starts_enabled
 test_restore_keeps_disabled_off
 test_restore_stops_disabled_running
 test_unanswered_preferences_change_nothing
+test_doctor_warns_with_no_plugin_log
 test_restore_is_idempotent_when_running
 test_forced_restore_restarts_only_new_code
 test_restore_relaunches_a_previous_servers_holder

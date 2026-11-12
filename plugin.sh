@@ -215,7 +215,9 @@ holder_outdated() {
 }
 
 relaunch() {
-  stop_daemon || return 0   # a survivor keeps its claim, so a launch would only be refused
+  # A holder that survives SIGTERM still loses its pidfile, and its identity watch ends it
+  # once the new daemon's claim names another file, so the launch goes ahead.
+  stop_daemon || true
   launch || true
 }
 
@@ -473,16 +475,12 @@ show_menu() {
   tmux_menu_show BUCKLESPRING "$(tmux_menu_decode "$back_b64")" "${rows[@]}"
 }
 
-# A log's last five lines on one line, for a doctor record's detail.
-log_tail() {
-  tail -5 "$1" 2>/dev/null | paste -sd'|' -
-}
-
 do_doctor() {
   # One record per check through the shared emitters (AI/tmux-plugin-lib.sh);
   # the collector reads them and the status daemon's registry keeps them. The
-  # exit status means "finished", never "healthy".
-  local stale plugin_log tail
+  # exit status means "finished", never "healthy". A log's last lines come from
+  # core's own tail reader, which is quiet for a missing or empty file.
+  local stale plugin_log _TMUX_DOCTOR_TAIL=""
   # shellcheck source=tmux-plugin-lib.sh
   . "$AI_DIR/tmux-plugin-lib.sh"
   if [ ! -x "$BUCKLE_DIR/buckle" ]; then
@@ -502,9 +500,9 @@ do_doctor() {
     # A failed start says why only on stderr, which core keeps as the plugin log, and a
     # red icon also means "off by choice", so intent on with no holder is a warning.
     plugin_log=$(tmux_plugin_expand_path "%CACHE%/tmux/plugin-bucklespring.log")
-    tail=$(log_tail "$plugin_log")
+    _tmux_doctor_tail "$plugin_log" 5
     tmux_doctor_warn bucklespring.daemon "key sounds are on, but no daemon runs" \
-      --detail "$plugin_log: ${tail:-(empty)}" \
+      --detail "$plugin_log: ${_TMUX_DOCTOR_TAIL:-(empty)}" \
       --remedy "Reconcile the plugin, which builds and starts the daemon; the fix does that now. The plugin log's last lines, in the detail, say why the last start failed." \
       --fix AI/tmux-plugin-lib.sh apply bucklespring
   elif [ -f "$BUCKLE_PIDFILE" ]; then
@@ -522,7 +520,10 @@ do_doctor() {
       --remedy "Grant Input Monitoring to the terminal that started tmux (the plugin menu's row opens that pane), or restart that terminal if it was updated while running." \
       --fix modules/bucklespring/plugin.sh open-perms
   fi
-  [ ! -f "$BUCKLE_LOG" ] || tmux_doctor_info bucklespring.log "log tail" --detail "$(log_tail "$BUCKLE_LOG")"
+  if [ -f "$BUCKLE_LOG" ]; then
+    _tmux_doctor_tail "$BUCKLE_LOG" 5
+    tmux_doctor_info bucklespring.log "log tail" --detail "$_TMUX_DOCTOR_TAIL"
+  fi
   return 0
 }
 
