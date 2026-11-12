@@ -604,7 +604,7 @@ test_audio_check() {
     skip "buckle --audio-check: no built binary — output backend unverifiable"
     return 0
   fi
-  out="$(gtimeout 20s "$REAL_BUCKLE_BIN" --audio-check 2>/dev/null)" || rc=$?
+  out="$(gtimeout 20s "$REAL_BUCKLE_BIN" --audio-check 2>"$TS_TMP/audio-check.log")" || rc=$?
   if [ "$rc" = 2 ]; then
     skip "buckle --audio-check: no output device on this host"
     return 0
@@ -612,6 +612,13 @@ test_audio_check() {
   assert_eq "buckle --audio-check: output renders on the system default device" 0 "$rc"
   assert_contains "buckle --audio-check: verdict names the device" "$out" 'device="'
   assert_contains "buckle --audio-check: verdict is ok" "$out" " ok"
+  # The CoreAudio output logs its state at each start and stop, which the status cell paints
+  # gray at rest; the check starts it as a click would and stops it as the idle timer would.
+  # OpenAL (Linux) logs neither.
+  if [ "$(uname -s)" = Darwin ]; then
+    assert_eq "buckle --audio-check: the output logs on at the start and off at the stop" "on off" \
+      "$(rg -o -r '$1' 'buckle: output (on|off)$' "$TS_TMP/audio-check.log" | paste -sd ' ' -)"
+  fi
 }
 
 # --- Restore reconciles persisted intent to process state --------------------

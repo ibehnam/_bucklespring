@@ -33,12 +33,14 @@ position, per-voice gain) into that unit.
 The unit runs only while clicks play. Startup creates and initialises it once, stopped (about
 130 ms, paid then); a click starts it (3 to 11 ms on the built-in speakers) after checking that
 it sits on the default device, since a stopped unit is never trusted to have followed a change,
-and it stops 30 seconds after the last click. Idle therefore means no render thread, no timer,
-no sleep assertion, and no file writes. Stopping clears the voices, so a click left over from a
-stall never plays at the next start. A start that takes over 150 ms drops its click and the
-keys queued behind it in the next 50 ms, since a click that late sounds wrong, and names the
-device once per life; the rule engages only after a measured slow start. No output device at
-startup is not fatal: the first click after one appears builds the unit.
+and it stops 30 seconds after the last click. Each start logs `output on` and each stop
+`output off`, and startup logs `output off until a key`, so the icon rests gray between bursts
+of typing. Idle therefore means no render thread, no timer, no sleep assertion, and no file
+writes. Stopping clears the voices, so a click left over from a stall never plays at the next
+start. A start that takes over 150 ms drops its click and the keys queued behind it in the next
+50 ms, since a click that late sounds wrong, and names the device once per life; the rule
+engages only after a measured slow start. No output device at startup is not fatal: the first
+click after one appears builds the unit.
 
 While the unit runs, a 0.5-second run-loop timer checks it: a render counter that has not
 advanced for 1.5 seconds is a stall, and a unit off the default device on two consecutive ticks
@@ -52,7 +54,7 @@ as a click would, proves it renders on the expected device, stops it, and proves
 stopped; the suite drives it. Reopen only on evidence: never reintroduce an app-side device
 listener or a reopen schedule, and never trust a library's success code for a device move (see
 [the lessons](lessons/output.md)). OpenAL and ALURE survive only in `audio-openal.c` for Linux and
-Windows, which write no stall line, so the icon there never stalls.
+Windows, which write no stall or output-state line, so the icon there never stalls or rests.
 
 ## Quiet hours and gain
 

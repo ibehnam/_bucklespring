@@ -202,10 +202,18 @@ static void on_unit_device(void *ref, AudioUnit unit, AudioUnitPropertyID id, Au
 	if (buf[0]) note("buckle: output device is now \"%s\"\n", buf);
 }
 
+/*
+ * The output's state is two log lines, `output on` at each start and `output off` at each
+ * stop, plus `output off until a key` at startup, since the unit starts parked; the status
+ * cell paints the icon gray while the latest is off. Only a change writes one.
+ */
+
 /* No render thread is running: drop every voice, so a click left over from a stall never
  * plays at the next start, and park the timer. */
 static void output_idle(void)
 {
+	if (g_running)
+		note("buckle: output off\n");
 	g_running = 0;
 	for (int v = 0; v < VOICES; v++)
 		atomic_store_explicit(&voices[v].state, V_FREE, memory_order_relaxed);
@@ -321,6 +329,7 @@ static int unit_start(void)
 		return -1;
 	}
 	g_running = 1;
+	note("buckle: output on\n");
 	g_seen_renders = atomic_load(&g_renders);
 	g_seen_ns = uptime_ns();
 	g_follow_misses = 0;
@@ -540,6 +549,7 @@ static void monitor_tick(CFRunLoopTimerRef timer, void *info)
 void audio_monitor(const char *heartbeat_path)
 {
 	(void)heartbeat_path;
+	note("buckle: output off until a key\n");
 	g_timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + PARKED_S, MONITOR_S,
 				       0, 0, monitor_tick, NULL);
 	if (!g_timer) {

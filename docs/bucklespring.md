@@ -56,13 +56,17 @@ moves with its sources.
 The icon is the status daemon's `bucklespring` producer on every host, computed from facts; the
 script never writes it. A live holder is green. A live holder whose keyboard tap the system
 refuses is orange, from the daemon's own log line. A live, enabled holder whose latest output
-line is `output stalled: <why>` is yellow, until `output recovered` or a fresh start. Anything
-else is red. The pidfile directory is a path watch, the pidfile and log are leaf watches, and the
-holder's pid an exit watch, so the cell turns red the instant the daemon dies. The menu's Input
-Monitoring row and the doctor read the published icon rather than parse the log a second time;
-the doctor also faults a live holder whose log says it is inert, which the icon shows green.
-`modules/tmuxd/src/cells/bucklespring.rs` holds the rules, and
-`AI/tests/test-tmuxd-parity.sh` pins them against goldens.
+line is `output stalled: <why>` is yellow, until `output recovered` or a fresh start. One whose
+latest output-state line is `output off` is gray, the house colour for idle: on macOS the
+output rests until a key, and the daemon logs `output off until a key` at startup and
+`output on` and `output off` at each start and stop ([capture](capture.md)); Linux logs neither
+and stays green. Orange stays the refused tap's alone, because the menu and the doctor match
+that form. Anything else is red. The pidfile directory is a path watch, the pidfile and log are
+leaf watches, and the holder's pid an exit watch, so the cell turns red the instant the daemon
+dies. The menu's Input Monitoring row and the doctor read the published icon rather than parse
+the log a second time; the doctor also faults a live holder whose log says it is inert, which
+the icon shows green. `modules/tmuxd/src/cells/bucklespring.rs` holds the rules, and
+`AI/tests/modules/test-tmuxd-parity.sh` pins them against goldens.
 
 ## Building
 
