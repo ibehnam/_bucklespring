@@ -7,19 +7,11 @@ The plugin controller (`plugin.sh`) owns start and stop, profile, gain, quiet ho
 `buckle_profile_rows` supplies the ordered profile list to the shell menu, launch validator,
 and compiler-only `menu-authority` command. The compiler executes this owner and mirrors its
 profiles and absolute pidfile path for native menus. Validation runs again when an action
-executes, so a removed profile can never become the daemon's setting. See [the lessons](lessons.md).
+executes, so a removed profile can never become the daemon's setting. See [the lessons](lessons/lifecycle.md).
 
 ## Identity
 
-The daemon claims its own pidfile: it opens `~/.cache/tmux-bucklespring/buckle.pid`, takes an
-exclusive `flock`, writes its pid, and holds the descriptor for life. A second daemon names the
-holder in its log and exits 75. SIGTERM removes the pidfile and exits 0; the script never writes
-it. The pidfile is the daemon's only handle: Stop signals that holder alone, after checking its
-command line still names `buckle`, and nothing asks or kills by process name
-(docs/lessons/daemons/identity.md). The daemon owns its log as well. Once it holds the lock, it
-rotates `buckle.log` to `buckle.log.1`, so the line naming the previous exit survives the restart
-that follows and a refused second daemon, which reports on the stderr it inherited, never moves
-the holder's log aside. Every exit leaves a line naming the signal or the ended run loop.
+The daemon claims, logs, and guards its own identity; see [identity](identity.md).
 
 ## Launch
 
@@ -29,12 +21,15 @@ depends on whether the start came from a menu, a restore, an SSH session, or a t
 macOS the tmux server is that launch's ancestor, so the daemon's responsible process is the
 terminal that started the server, and that terminal's Input Monitoring grant covers the keyboard
 tap. `buckle` holds no grant, signature, or LaunchAgent of its own ([capture](capture.md),
-[lessons](lessons.md)).
+[lessons](lessons/permissions.md)). The launch passes `--mute-keycode 0`: the daemon drops code 0 before its
+mute check, so no double-tapped key can silence it under a green icon.
 
 ## Settings
 
 Gain, quiet hours, and profile reach the daemon through one settings file beside the pidfile.
-The script writes it compare-first from the durable preferences and announces a change with
+The script reads the five preferences with one tmux call; a read that returns none changes
+nothing, so a server that did not answer never reads as "off". It writes the file compare-first
+from the durable preferences and announces a change with
 SIGHUP; the daemon applies it at the next click and reloads samples when the profile changed. A
 preference therefore never restarts the daemon and never starts a stopped one. The quiet level
 is derived from the shared level set in the shell, so only the time comparison exists in C.
@@ -48,8 +43,10 @@ relaunches one whose binary is newer than its claim or whose claim is older than
 server, and otherwise signals a changed setting. The second rule exists because a detached
 daemon outlives its server while its grant stays with that server's terminal: after the terminal
 and tmux restart, the new server's reconciler replaces the deaf survivor.
-With intent off, it stops a daemon that still runs. No supervisor watches the process, so the
-reconciler at attach is what restarts a dead daemon; the icon turns red the moment one dies.
+With intent off, it stops a daemon that still runs, and reports one that survives SIGTERM. No
+supervisor watches the process, so the reconciler at attach is what restarts a dead daemon; the
+icon turns red the moment one dies, and the doctor warns while intent is on and no daemon runs,
+with the plugin log's last lines, since a failed start says why only there.
 Unattended paths never open a build popup: they rebuild a binary older than its sources quietly
 into `build.log`. Every launch requires a current binary, because the daemon's argv contract
 moves with its sources.
@@ -58,11 +55,13 @@ moves with its sources.
 
 The icon is the status daemon's `bucklespring` producer on every host, computed from facts; the
 script never writes it. A live holder is green. A live holder whose keyboard tap the system
-refuses is orange, from the daemon's own log line. A live, enabled holder whose `render.hb`
-heartbeat is older than fifteen seconds is yellow. Anything else is red. The pidfile directory is
-a path watch and the holder's pid an exit watch, so the cell turns red the instant the daemon
-dies. The menu's Input Monitoring row and the doctor read the published icon rather than parse
-the log a second time. `modules/tmuxd/src/cells/bucklespring.rs` holds the rules, and
+refuses is orange, from the daemon's own log line. A live, enabled holder whose latest output
+line is `output stalled: <why>` is yellow, until `output recovered` or a fresh start. Anything
+else is red. The pidfile directory is a path watch, the pidfile and log are leaf watches, and the
+holder's pid an exit watch, so the cell turns red the instant the daemon dies. The menu's Input
+Monitoring row and the doctor read the published icon rather than parse the log a second time;
+the doctor also faults a live holder whose log says it is inert, which the icon shows green.
+`modules/tmuxd/src/cells/bucklespring.rs` holds the rules, and
 `AI/tests/test-tmuxd-parity.sh` pins them against goldens.
 
 ## Building

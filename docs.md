@@ -4,6 +4,7 @@
 
 The `bucklespring` plugin owns key sounds: the `buckle` daemon; the sound preferences and their menu; and the key-sound icon, whose producer it owns in the status daemon.
 
-- [Lifecycle](docs/bucklespring.md): the pidfile claim, the detached launch, settings delivery, reconciliation, the icon, and building.
-- [Capture and output](docs/capture.md): the keyboard tap and the terminal's permission, the output unit, the heartbeat, and quiet hours.
-- [Lessons](docs/lessons.md): the incidents behind the profile list, the detacher, the backend, identity, permissions, and the retired LaunchAgent.
+- [Lifecycle](docs/bucklespring.md): the detached launch, settings delivery, reconciliation, the icon, the doctor, and building.
+- [Identity](docs/identity.md): the pidfile claim, the log, the watch that ends an orphan, and the home rule that keeps a sandbox's daemon inert.
+- [Capture and output](docs/capture.md): the keyboard tap and its modifiers, the terminal's permission, the output unit that runs only while clicks play, its stall lines, and quiet hours.
+- [Lessons](docs/lessons.md): the incidents behind the profile list, the detacher, the backend and its always-on output, identity, permissions, and the retired LaunchAgent.

@@ -17,27 +17,42 @@ paints a live but deaf daemon orange, never green. The tap also re-enables itsel
 WindowServer reports a timeout or user-input disable. This healing lives in the C fork, so the
 loaded sound buffers survive it.
 
+A modifier sends `flagsChanged`, which carries no press or release, so each one is read from its
+side's own device bit in the event's flags (`NX_DEVICE*KEYMASK`); toggling per event swapped a
+key's press and release for good after one missed event. Caps Lock and Fn, which have no bit,
+and an event with the generic flag but neither side's bit still toggle.
+
 ## The output unit
 
 Audio output on macOS is native CoreAudio (`audio-coreaudio.c`, behind the backend interface in
 `buckle.h`): a DefaultOutput AudioUnit, which CoreAudio itself keeps on the system default
 output across AirPods pairing, Control Centre switches, hot-plug, and AirPlay. Nothing listens
 for device changes; the fork mixes its own voices (constant-power pan from the key's row
-position, per-voice gain) into that unit. A 0.5-second run-loop timer is the watchdog: it
-rebuilds the unit when the render counter has not advanced for 1.5 seconds, or when the unit is
-off the default device on two consecutive ticks, so a device move heals within a second without
-waiting for a keystroke. A rebuild that does not bring rendering back doubles the wait before the
-next, up to five minutes, and the first render resets it, so a dead output cannot flood the log.
-Uptime drives the stall check, so a sleep never reads as a stall.
+position, per-voice gain) into that unit.
 
-The same timer renames `render.hb` (`<renders> <epoch>`) into place beside the pidfile every five
-seconds while the counter advances, at once when rendering resumes, and never while it is
-stalled; the cell paints a heartbeat older than fifteen seconds yellow. `--audio-check` opens the
-output silently and reports whether it renders on the expected device; the suite drives it.
-Reopen only on evidence: never reintroduce an app-side device listener or a reopen schedule,
-and never trust a library's success code for a device move (see [the lessons](lessons.md)).
-OpenAL and ALURE survive only in `audio-openal.c` for Linux and Windows, which write no
-heartbeat, so the icon there never stalls.
+The unit runs only while clicks play. Startup creates and initialises it once, stopped (about
+130 ms, paid then); a click starts it (3 to 11 ms on the built-in speakers) after checking that
+it sits on the default device, since a stopped unit is never trusted to have followed a change,
+and it stops 30 seconds after the last click. Idle therefore means no render thread, no timer,
+no sleep assertion, and no file writes. Stopping clears the voices, so a click left over from a
+stall never plays at the next start. A start that takes over 150 ms drops its click and the
+keys queued behind it in the next 50 ms, since a click that late sounds wrong, and names the
+device once per life; the rule engages only after a measured slow start. No output device at
+startup is not fatal: the first click after one appears builds the unit.
+
+While the unit runs, a 0.5-second run-loop timer checks it: a render counter that has not
+advanced for 1.5 seconds is a stall, and a unit off the default device on two consecutive ticks
+missed a move. Either, like a failed start, gets the unit rebuilt; a rebuild that does not bring
+rendering back doubles the wait before the next, up to five minutes, the first render resets
+it, and a new default device ends it at once. Uptime drives every check, so a sleep never reads
+as a stall. A stall is two log lines, `output stalled: <why>` and `output recovered`, which the
+cell reads as it reads the tap's; the identity thread also writes one when the key thread has
+not pulsed for 15 seconds, so a hung daemon still turns yellow. `--audio-check` starts the unit
+as a click would, proves it renders on the expected device, stops it, and proves the rendering
+stopped; the suite drives it. Reopen only on evidence: never reintroduce an app-side device
+listener or a reopen schedule, and never trust a library's success code for a device move (see
+[the lessons](lessons/output.md)). OpenAL and ALURE survive only in `audio-openal.c` for Linux and
+Windows, which write no stall line, so the icon there never stalls.
 
 ## Quiet hours and gain
 
@@ -51,5 +66,4 @@ agree.
 
 ## Files
 
-The pidfile, log, previous log, settings file, and heartbeat live under
-`~/.cache/tmux-bucklespring/`.
+The pidfile, log, previous log, and settings file live under `~/.cache/tmux-bucklespring/`.

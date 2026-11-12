@@ -530,6 +530,62 @@ test_claim_is_exclusive() {
   assert_rc1 "buckle claim: and removes the pidfile" test -e "$dir/buckle.pid"
 }
 
+# --- The daemon dies with its identity ------------------------------------------
+# A daemon whose pidfile is gone is beyond any Stop: two test daemons outlived their removed
+# sandbox and clicked until a reboot. The real binary ends itself within about two seconds of
+# losing its claim and says why, here in a log outside the removed directory.
+test_orphan_exits() {
+  local dir="$TS_TMP/orphan" log="$TS_TMP/orphan.log" pid rc=0
+  if [ ! -x "$REAL_BUCKLE_BIN" ] || ! "$REAL_BUCKLE_BIN" --help 2>&1 | rg -q -- '--claim-only'; then
+    skip "buckle orphan: no built binary with the claim"
+    return 0
+  fi
+  mkdir -p "$dir"
+  "$REAL_BUCKLE_BIN" --log "$log" --pidfile "$dir/buckle.pid" --claim-only &
+  pid=$!
+  assert_rc0 "buckle orphan: the holder claims its pidfile" wait_file_contains "$dir/buckle.pid" "$pid"
+  rm -rf "$dir"
+  assert_rc0 "buckle orphan: it exits within seconds of its directory's removal" wait_dead "$pid"
+  kill -KILL "$pid" 2>/dev/null   # an old binary would hold on forever; never leave it behind
+  wait "$pid" 2>/dev/null || rc=$?
+  assert_eq "buckle orphan: with a failure status" 1 "$rc"
+  assert_contains "buckle orphan: and says why" "$(cat "$log" 2>/dev/null)" \
+    "buckle: $dir/buckle.pid no longer names this daemon; exiting"
+}
+
+# --- The keyboard and the speakers belong to the account -------------------------
+# A daemon whose pidfile lies outside the account's home, as every sandbox's does, holds its
+# claim with neither the keyboard tap nor the output, says so, and still rereads its settings
+# on SIGHUP. The reread is the barrier: it runs on the main thread, which only the inert
+# path leaves free to take it before a key.
+test_sandbox_daemon_is_inert() {
+  local dir="$TS_TMP/inert" home pid rc=0
+  if [ ! -x "$REAL_BUCKLE_BIN" ] || ! "$REAL_BUCKLE_BIN" --help 2>&1 | rg -q -- '--claim-only'; then
+    skip "buckle inert: no built binary with the claim"
+    return 0
+  fi
+  home=$(perl -e 'print((getpwuid($<))[7])')
+  case "$TS_TMP/" in "${home%/}"/*)
+    skip "buckle inert: this sandbox lies under the account's home, where the daemon takes the keyboard"
+    return 0 ;;
+  esac
+  mkdir -p "$dir"
+  printf 'gain=30\n' > "$dir/settings"
+  "$REAL_BUCKLE_BIN" --log "$dir/buckle.log" --pidfile "$dir/buckle.pid" --settings "$dir/settings" &
+  pid=$!
+  assert_rc0 "buckle inert: a sandbox's daemon holds its claim without the keyboard or the speakers" \
+    wait_file_contains "$dir/buckle.log" "buckle: $dir/buckle.pid is outside the account's home; holding the claim without the keyboard or the speakers"
+  printf 'gain=60\n' > "$dir/settings"
+  kill -HUP "$pid" 2>/dev/null
+  assert_rc0 "buckle inert: SIGHUP rereads its settings" wait_file_contains "$dir/buckle.log" "settings: gain 60"
+  assert_rc1 "buckle inert: it never opened the keyboard tap or the output" \
+    rg -q -e 'event tap' -e 'buckle: output' -e 'output unit' "$dir/buckle.log"
+  kill -TERM "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null || rc=$?
+  assert_eq "buckle inert: TERM is a clean exit" 0 "$rc"
+  assert_rc1 "buckle inert: and removes the pidfile" test -e "$dir/buckle.pid"
+}
+
 # --- The output backend: renders, and on the device it should -----------------
 # --audio-check opens the real output silently (no click), proves the render callback runs,
 # and that the unit sits on the system default output — the property the whole "headphones
@@ -597,6 +653,24 @@ test_restore_stops_disabled_running() {
 
   assert_rc0 "buckle restore: disabled intent stops a live daemon" wait_live_count 0
   assert_eq "buckle restore: disabling launches no replacement" "0" "$(launch_count)"
+}
+
+# A server that answers none of the five preferences (its options lost, or the hook ran
+# before init seeded them) gives no intent at all. The reconciler reads them in one call and
+# changes nothing then; before, the empty answer read as "off" and stopped a live daemon.
+test_unanswered_preferences_change_nothing() {
+  local pid
+  rm -f "$BUCKLE_LAUNCH_LOG"
+  mark_running
+  pid=$(cat "$BUCKLE_PIDFILE")
+  tmux set -gu @buckle_enabled \; set -gu @buckle_profile \; set -gu @buckle_gain \
+    \; set -gu @buckle_quiet_from \; set -gu @buckle_quiet_to
+
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" attach
+
+  assert_rc0 "buckle attach: unanswered preferences stop no daemon" kill -0 "$pid"
+  assert_eq "buckle attach: and launch nothing" "0" "$(launch_count)"
+  clear_running
 }
 
 test_restore_is_idempotent_when_running() {
@@ -706,10 +780,13 @@ test_plugin_round_trip_resumes_intent
 test_gain_at_parity
 test_settings_reach_the_binary
 test_claim_is_exclusive
+test_orphan_exits
+test_sandbox_daemon_is_inert
 test_audio_check
 test_restore_starts_enabled
 test_restore_keeps_disabled_off
 test_restore_stops_disabled_running
+test_unanswered_preferences_change_nothing
 test_restore_is_idempotent_when_running
 test_forced_restore_restarts_only_new_code
 test_restore_relaunches_a_previous_servers_holder
