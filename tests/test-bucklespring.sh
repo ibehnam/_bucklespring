@@ -365,6 +365,15 @@ test_quiet_commit_signals_running() {
   assert_eq "buckle quiet-commit: empty commits OFF (from == to)" "0 0" \
     "$(tmux show -gqv @buckle_quiet_from) $(tmux show -gqv @buckle_quiet_to)"
   assert_contains "buckle quiet-commit: off reaches the settings file" "$(settings)" $'quiet_from=0\nquiet_to=0'
+
+  # The menu's row and the native router pass the typed text as a literal --value; the
+  # router adds --native --ui and reopens its own menu, never the shell's.
+  : > "$RUN_SHELL_LOG"
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" quiet-commit --native --ui --value "21:00-07:00"
+  assert_eq "buckle quiet-commit: a literal --value commits" "1260 420" \
+    "$(tmux show -gqv @buckle_quiet_from) $(tmux show -gqv @buckle_quiet_to)"
+  assert_rc1 "buckle quiet-commit: the native router's call reopens no shell menu" \
+    rg -q -F "menu -" "$RUN_SHELL_LOG"
   clear_running
 }
 

@@ -335,12 +335,28 @@ do_gain() {
   apply_settings
 }
 
-# Commit the quiet-hours prompt (the row built by tmux_menu_quiet_row writes the typed text
-# to @buckle_quiet_input and calls this). The shared helper owns read/parse/unset/write.
-# Reopen through a detached tmux job; keeping this menu shell alive would make it the
-# accidental parent of anything it started.
-do_quiet_commit() {
-  if tmux_quiet_commit @buckle_quiet_input @buckle_quiet_from @buckle_quiet_to; then
+# Commit the quiet-hours prompt. The shared helper owns the parse and the paired write. The
+# menu's row (tmux_menu_quiet_row) and the native router pass the typed text as --value; an
+# older row left it in @buckle_quiet_input, which the helper reads and unsets. Reopen
+# through a detached tmux job; keeping this menu shell alive would make it the accidental
+# parent of anything it started.
+do_quiet_commit() { # [--native] [--ui] [BACK] [--value TEXT]
+  local native=0 back="" value_set=0 value="" committed=1
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --native) native=1 ;;
+      --ui) ;;
+      --value) shift; [ "$#" -gt 0 ] || return 2; value="$1"; value_set=1 ;;
+      *) back="$1" ;;
+    esac
+    shift
+  done
+  if [ "$value_set" = 1 ]; then
+    tmux_quiet_commit @buckle_quiet_input @buckle_quiet_from @buckle_quiet_to "$value" && committed=0
+  else
+    tmux_quiet_commit @buckle_quiet_input @buckle_quiet_from @buckle_quiet_to && committed=0
+  fi
+  if [ "$committed" = 0 ]; then
     "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
     apply_settings
   else
@@ -348,8 +364,8 @@ do_quiet_commit() {
   fi
   # The native menu router owns its validated callback and sticky reopen.  The
   # shell owns only parse, persistence, and rejection feedback.
-  [ "${1:-}" = --native ] && return 0
-  tmux run-shell -b "TMUX_MENU_SELECT=${TMUX_MENU_SELECT:-} '$SELF' menu - ${1:-}" >/dev/null 2>&1 || true
+  [ "$native" = 1 ] && return 0
+  tmux run-shell -b "TMUX_MENU_SELECT=${TMUX_MENU_SELECT:-} '$SELF' menu - $back" >/dev/null 2>&1 || true
 }
 
 # Reconcile persisted intent without interactive UI. Init, attach, and restore share it,
@@ -439,7 +455,7 @@ show_menu() {
   # stays valid in the rebuilt menu (docs/ui/menus.md).
   rows+=("separator")
   tmux_menu_quiet_row rows "$(quiet_from)" "$(quiet_to)" h \
-    @buckle_quiet_input "$SELF quiet-commit${back_b64:+ $back_b64}"
+    "$SELF quiet-commit${back_b64:+ $back_b64}"
 
   # (existing) separator + Running toggle — serves as the volume|toggle divider. The ✓+bold
   # checkbox marks the daemon as running, matching every other stateful toggle.
@@ -521,7 +537,7 @@ case "${1:-}" in
   stop)          do_stop ;;
   toggle)        do_toggle ;;
   gain)          do_gain "${2:?missing percent}" ;;
-  quiet-commit)  do_quiet_commit "${2:-}" ;;         # prompt round-trip target from the menu's quiet row
+  quiet-commit)  shift; do_quiet_commit "$@" ;;      # prompt round-trip target from the menu's quiet row
   menu-authority) menu_authority ;;
   profile-valid) buckle_profile_valid "${2:-}" ;;
   restore)       reconcile_intent ;;
