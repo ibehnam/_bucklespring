@@ -363,6 +363,9 @@ static int output_start(uint64_t now)
 int audio_open(const char *device)
 {
 	char buf[256];
+	/* Supervision starts here, not at the tap watchdog's first tick: a jammed coreaudiod
+	 * blocks this very call, and only a key thread that has pulsed can be seen to stop. */
+	pulse();
 	g_pinned = kAudioObjectUnknown;
 	if (device) {
 		g_pinned = device_by_name(device);
