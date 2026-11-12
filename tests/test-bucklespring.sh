@@ -389,6 +389,9 @@ test_gain_signals_running() {
   clear_running
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" gain 50
   assert_eq "buckle gain: a stopped buckle is not started" "0" "$(launch_count)"
+  # The level is durable, not only a live option: the store a restart restores from has it.
+  assert_eq "buckle gain: the level is committed to the preference store" 50 \
+    "$("$TMUXD_BIN" state get machine tmux preferences @buckle_gain 2>/dev/null)"
   tmux set -g @buckle_gain 100
 }
 
@@ -428,8 +431,12 @@ test_profile_switch_signals_the_daemon() {
   assert_eq "buckle switch: exactly one launch occurred" 1 "$(launch_count)"
   assert_rc0 "buckle switch: still one live daemon" wait_live_count 1
   assert_contains "buckle switch: the new profile is in the settings file" "$(settings)" "profile=Typewriter"
+  assert_eq "buckle switch: start commits the profile and the switch durably" "Typewriter 1" \
+    "$("$TMUXD_BIN" state get machine tmux preferences @buckle_profile 2>/dev/null) $("$TMUXD_BIN" state get machine tmux preferences @buckle_enabled 2>/dev/null)"
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" stop
   assert_rc0 "buckle switch: final stop leaves no fake" wait_live_count 0
+  assert_eq "buckle switch: stop commits the switch off durably" 0 \
+    "$("$TMUXD_BIN" state get machine tmux preferences @buckle_enabled 2>/dev/null)"
 }
 
 test_plugin_round_trip_resumes_intent() {

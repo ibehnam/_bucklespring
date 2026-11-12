@@ -291,9 +291,8 @@ do_start() {
     return 2
   }
   ensure_binary "${2:-}" || return 1
-  tmux set -g @buckle_profile "$profile"
-  tmux set -g @buckle_enabled 1
-  "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
+  # The durable setter commits both preferences, then projects them onto tmux.
+  "$AI_DIR/tmux-status-persist.sh" set @buckle_profile "$profile" @buckle_enabled 1 || return 1
   if read_prefs; then write_settings || true; fi
   # A live daemon takes the new profile at its next click; an outdated one restarts.
   if is_running; then
@@ -313,8 +312,7 @@ do_teardown() {
 
 do_stop() {
   local rc=0
-  tmux set -g @buckle_enabled 0
-  "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
+  "$AI_DIR/tmux-status-persist.sh" set @buckle_enabled 0 || rc=1
   stop_daemon || rc=1
   refresh_icon
   return "$rc"
@@ -332,8 +330,7 @@ do_toggle() {
 # Set the gain (volume) percent. Changing the volume must NOT start a stopped buckle,
 # mirroring notif, where picking a level is not the same as unmuting.
 do_gain() {
-  tmux set -g @buckle_gain "$1"
-  "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
+  "$AI_DIR/tmux-status-persist.sh" set @buckle_gain "$1" || return 1
   apply_settings
 }
 
@@ -359,8 +356,7 @@ do_quiet_commit() { # [--native] [--ui] [BACK] [--value TEXT]
     tmux_quiet_commit @buckle_quiet_input @buckle_quiet_from @buckle_quiet_to && committed=0
   fi
   if [ "$committed" = 0 ]; then
-    "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
-    apply_settings
+    apply_settings   # tmux_quiet_commit already committed the pair durably
   else
     tmux_msg --class notice "$TMUX_QUIET_HINT"
   fi
