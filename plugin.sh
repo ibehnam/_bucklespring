@@ -80,12 +80,33 @@ is_running() {
   tmux_daemon_is_live "$BUCKLE_PIDFILE" buckle
 }
 
+# The five preferences, read with ONE tmux call into the PREF_* globals: each as
+# stored, empty when unset. Every entry point that needs them reads them once,
+# after its own writes, and the accessors below use what it read. A read that
+# returns no rows at all fails, so a server that did not answer is never taken
+# for "off", which would stop a running daemon, or for the defaults, which would
+# overwrite the settings file.
+read_prefs() {
+  local name value rows=0
+  PREF_ENABLED="" PREF_PROFILE="" PREF_GAIN="" PREF_QUIET_FROM="" PREF_QUIET_TO=""
+  while IFS=$'\t' read -r name value; do
+    rows=$((rows + 1))
+    case "$name" in
+      @buckle_enabled) PREF_ENABLED=$value ;;
+      @buckle_profile) PREF_PROFILE=$value ;;
+      @buckle_gain) PREF_GAIN=$value ;;
+      @buckle_quiet_from) PREF_QUIET_FROM=$value ;;
+      @buckle_quiet_to) PREF_QUIET_TO=$value ;;
+    esac
+  done < <(tmux_global_option_dump @buckle_enabled @buckle_profile @buckle_gain \
+    @buckle_quiet_from @buckle_quiet_to)
+  [ "$rows" -gt 0 ]
+}
+
 # The selected profile: the last one started (@buckle_profile), else the
 # built-in default. Single source for the settings file and the menu mark.
 current_profile() {
-  local p
-  p="$(tmux show -gqv @buckle_profile 2>/dev/null)" || true
-  p="${p:-default}"
+  local p="${PREF_PROFILE:-default}"
   buckle_profile_valid "$p" || p=default
   printf '%s' "$p"
 }
@@ -95,9 +116,7 @@ current_profile() {
 # and the menu's bold mark, always get a canonical offered level: a persisted orphan (a value
 # dropped from the level list) can't play or bold at a level no menu row marks.
 current_gain() {
-  local g
-  g="$(tmux show -gqv @buckle_gain 2>/dev/null)" || true
-  tmux_volume_snap "${g:-100}"
+  tmux_volume_snap "${PREF_GAIN:-100}"
 }
 
 # Buckle's OWN quiet window in minutes since midnight, independent of notif's by
@@ -106,21 +125,19 @@ current_gain() {
 # exactly as it did. The daemon compares the window against its own clock on every
 # keystroke, so it dims and un-dims with no timer and no relaunch.
 quiet_from() {
-  local v; v="$(tmux show -gqv @buckle_quiet_from 2>/dev/null)" || true
-  printf '%s' "${v:-0}"
+  printf '%s' "${PREF_QUIET_FROM:-0}"
 }
 quiet_to() {
-  local v; v="$(tmux show -gqv @buckle_quiet_to 2>/dev/null)" || true
-  printf '%s' "${v:-0}"
+  printf '%s' "${PREF_QUIET_TO:-0}"
 }
 
 # ---------------------------------------------------------------------------
 # Settings: the one channel from the preferences to a running daemon.
 
-# Project the durable preferences into the daemon's settings file, compare-first:
-# rc 0 when the file changed, 1 when it already said this. The quiet LEVEL is derived
-# here from TMUX_VOLUME_LEVELS, so the level domain stays single-sourced in the shell
-# and only the time comparison exists in C.
+# Project the durable preferences, as the caller's read_prefs left them, into the
+# daemon's settings file, compare-first: rc 0 when the file changed, 1 when it already
+# said this. The quiet LEVEL is derived here from TMUX_VOLUME_LEVELS, so the level
+# domain stays single-sourced in the shell and only the time comparison exists in C.
 write_settings() {
   local want have=""
   want=$(printf 'gain=%s\nquiet_from=%s\nquiet_to=%s\nquiet_gain=%s\nprofile=%s\n' \
@@ -142,6 +159,7 @@ signal_holder() {
 
 # Settings changed by a menu: rewrite, and let a live daemon apply them at its next click.
 apply_settings() {
+  read_prefs || return 0
   if write_settings; then signal_holder; fi
 }
 
@@ -163,18 +181,25 @@ wait_live() {
 # lifetime independent of the caller. The caller has written the settings; a
 # binary older than its sources is never launched (ensure_binary says why). The
 # daemon rotates and opens its own log as its first argument; the detacher's
-# output would truncate the previous life's log before it could.
+# output would truncate the previous life's log before it could. Mute keycode 0
+# turns the double-tap mute off: the daemon drops code 0 before the mute check,
+# and a mute behind Scroll Lock silenced it with the icon still green.
 launch() {
   binary_current || return 1
   mkdir -p "$BUCKLE_CACHE_DIR"
   tmux_tmuxd_detach "$BUCKLE_DIR" /dev/null ./buckle \
-    --log "$BUCKLE_LOG" --pidfile "$BUCKLE_PIDFILE" --settings "$BUCKLE_SETTINGS" >/dev/null || return 1
+    --log "$BUCKLE_LOG" --pidfile "$BUCKLE_PIDFILE" --settings "$BUCKLE_SETTINGS" \
+    --mute-keycode 0 >/dev/null || return 1
   wait_live || printf 'bucklespring: no live holder a second after launch; see %s\n' "$BUCKLE_LOG" >&2
   return 0
 }
 
+# Stop the pidfile's holder. One that outlives SIGTERM is reported on stderr, the
+# plugin log, and fails, rather than passing for stopped.
 stop_daemon() {
-  tmux_daemon_stop "$BUCKLE_PIDFILE" "" buckle || true
+  tmux_daemon_stop "$BUCKLE_PIDFILE" "" buckle && return 0
+  printf 'bucklespring: the daemon in %s survived SIGTERM\n' "$BUCKLE_PIDFILE" >&2
+  return 1
 }
 
 # A live holder to replace: the binary is newer than its claim (new code), or the
@@ -190,22 +215,29 @@ holder_outdated() {
 }
 
 relaunch() {
-  stop_daemon
+  stop_daemon || return 0   # a survivor keeps its claim, so a launch would only be refused
   launch || true
 }
 
 # ---------------------------------------------------------------------------
 # Building.
 
+# The first of the daemon's sources newer than its binary, if any: the one test
+# binary_current and the doctor share.
+stale_source() {
+  local src
+  for src in "$BUCKLE_DIR"/*.c "$BUCKLE_DIR"/*.m "$BUCKLE_DIR"/*.h "$BUCKLE_DIR/Makefile"; do
+    [ "$src" -nt "$BUCKLE_DIR/buckle" ] && { printf '%s' "$src"; return 0; }
+  done
+  return 1
+}
+
 # Current when the binary exists and no source is newer than it. This makes a
 # committed source/submodule change actually reach the running process — the
 # Makefile is incremental, so a rebuild is cheap and a no-op when current. (A
 # stale binary, not a missing one, was how a prior audio fix never took effect.)
 binary_current() {
-  local bin="$BUCKLE_DIR/buckle" stale
-  [[ -x "$bin" ]] || return 1
-  stale="$(find "$BUCKLE_DIR" -maxdepth 1 \( -name '*.c' -o -name '*.m' -o -name '*.h' -o -name 'Makefile' \) -newer "$bin" -print -quit 2>/dev/null)"
-  [[ -z "$stale" ]]
+  [ -x "$BUCKLE_DIR/buckle" ] && ! stale_source >/dev/null
 }
 
 # Only a current binary is launched, because the daemon's argv contract moves
@@ -260,7 +292,7 @@ do_start() {
   tmux set -g @buckle_profile "$profile"
   tmux set -g @buckle_enabled 1
   "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
-  write_settings || true
+  if read_prefs; then write_settings || true; fi
   # A live daemon takes the new profile at its next click; an outdated one restarts.
   if is_running; then
     if holder_outdated; then relaunch; else signal_holder; fi
@@ -278,16 +310,19 @@ do_teardown() {
 }
 
 do_stop() {
+  local rc=0
   tmux set -g @buckle_enabled 0
   "$AI_DIR/tmux-status-persist.sh" save 2>/dev/null || true
-  stop_daemon
+  stop_daemon || rc=1
   refresh_icon
+  return "$rc"
 }
 
 do_toggle() {
   if is_running; then
     do_stop
   else
+    read_prefs || return 0
     do_start "$(current_profile)"
   fi
 }
@@ -322,10 +357,11 @@ do_quiet_commit() {
 # hook, so it is idempotent and restarts a live daemon only for new code: a settings
 # change is a SIGHUP.
 reconcile_intent() {
-  local enabled changed=0
-  enabled="$(tmux show -gqv @buckle_enabled 2>/dev/null)"
+  local changed=0
+  # One read of the preferences, and one that returns nothing changes nothing.
+  read_prefs || return 0
   write_settings && changed=1
-  if [ "$enabled" = 1 ]; then
+  if [ "$PREF_ENABLED" = 1 ]; then
     # New sources are built before anything is decided, so a daemon they outdate
     # is relaunched below, as is one another server started; a build that fails
     # leaves a live daemon alone.
@@ -340,7 +376,7 @@ reconcile_intent() {
   elif is_running; then
     # Off, yet a daemon runs: it outlived the server that started it, or a
     # restore brought back a server whose intent says off.
-    stop_daemon
+    stop_daemon || true
   fi
   refresh_icon
 }
@@ -374,6 +410,7 @@ open_perms() {
 
 show_menu() {
   local back_b64="${1:-}"
+  read_prefs || true
   local current; current="$(current_profile)"
   # Sticky reopen is declared once as constructor metadata. Toggle rows stay pure; compose
   # derives each row's index and owns the action + reopen chain.
@@ -420,41 +457,56 @@ show_menu() {
   tmux_menu_show BUCKLESPRING "$(tmux_menu_decode "$back_b64")" "${rows[@]}"
 }
 
+# A log's last five lines on one line, for a doctor record's detail.
+log_tail() {
+  tail -5 "$1" 2>/dev/null | paste -sd'|' -
+}
+
 do_doctor() {
   # One record per check through the shared emitters (AI/tmux-plugin-lib.sh);
   # the collector reads them and the status daemon's registry keeps them. The
   # exit status means "finished", never "healthy".
-  local stale="" age
+  local stale plugin_log tail
   # shellcheck source=tmux-plugin-lib.sh
   . "$AI_DIR/tmux-plugin-lib.sh"
-  if [ -x "$BUCKLE_DIR/buckle" ]; then
-    stale=$(find "$BUCKLE_DIR" -maxdepth 1 \( -name '*.c' -o -name '*.m' -o -name '*.h' -o -name Makefile \) -newer "$BUCKLE_DIR/buckle" -print -quit 2>/dev/null)
-    if [ -z "$stale" ]; then
-      tmux_doctor_ok bucklespring.binary "binary is current"
-    else
-      tmux_doctor_info bucklespring.binary "binary is older than its source" --detail "$stale" \
-        --remedy "Rebuild it with make in modules/bucklespring; the fix does that now." --fix make -C modules/bucklespring
-    fi
-  else
+  if [ ! -x "$BUCKLE_DIR/buckle" ]; then
     tmux_doctor_warn bucklespring.binary "binary missing" \
       --remedy "Build it with make in modules/bucklespring (system frameworks only on macOS); until then no key sounds play." \
       --fix make -C modules/bucklespring
+  elif stale=$(stale_source); then
+    tmux_doctor_info bucklespring.binary "binary is older than its source" --detail "$stale" \
+      --remedy "Rebuild it with make in modules/bucklespring; the fix does that now." --fix make -C modules/bucklespring
+  else
+    tmux_doctor_ok bucklespring.binary "binary is current"
   fi
-  if tmux_daemon_is_live "$BUCKLE_PIDFILE" buckle; then
+  read_prefs || true
+  if is_running; then
     tmux_doctor_ok bucklespring.daemon "pidfile holder is live"
+  elif [ "$PREF_ENABLED" = 1 ]; then
+    # A failed start says why only on stderr, which core keeps as the plugin log, and a
+    # red icon also means "off by choice", so intent on with no holder is a warning.
+    plugin_log=$(tmux_plugin_expand_path "%CACHE%/tmux/plugin-bucklespring.log")
+    tail=$(log_tail "$plugin_log")
+    tmux_doctor_warn bucklespring.daemon "key sounds are on, but no daemon runs" \
+      --detail "$plugin_log: ${tail:-(empty)}" \
+      --remedy "Reconcile the plugin, which builds and starts the daemon; the fix does that now. The plugin log's last lines, in the detail, say why the last start failed." \
+      --fix AI/tmux-plugin-lib.sh apply bucklespring
   elif [ -f "$BUCKLE_PIDFILE" ]; then
     tmux_doctor_info bucklespring.daemon "stale pidfile" --detail "$BUCKLE_PIDFILE"
   fi
-  if [ -f "$BUCKLE_CACHE_DIR/render.hb" ]; then
-    age=$(( $(date +%s) - $(tmux_get_mtime "$BUCKLE_CACHE_DIR/render.hb") ))
-    tmux_doctor_info bucklespring.audio "audio heartbeat ${age}s old"
+  # The daemon keeps the keyboard and the speakers for a pidfile under the account's home;
+  # elsewhere, a test sandbox's rule, it holds its claim inert, green yet silent.
+  if is_running && rg -q -F 'holding the claim without the keyboard or the speakers' "$BUCKLE_LOG" 2>/dev/null; then
+    tmux_doctor_fault bucklespring.inert "the daemon holds its claim without the keyboard or the speakers" \
+      --detail "$BUCKLE_PIDFILE is outside the account's home" \
+      --remedy "Keep the pidfile under the account's home: remove the XDG_CACHE_HOME or BUCKLE_PIDFILE that points elsewhere, then Stop and Start the daemon from the plugin's menu."
   fi
   if denied_published; then
     tmux_doctor_fault bucklespring.input_monitoring "the keyboard tap is refused" \
       --remedy "Grant Input Monitoring to the terminal that started tmux (the plugin menu's row opens that pane), or restart that terminal if it was updated while running." \
       --fix modules/bucklespring/plugin.sh open-perms
   fi
-  [ ! -f "$BUCKLE_LOG" ] || tmux_doctor_info bucklespring.log "log tail" --detail "$(tail -5 "$BUCKLE_LOG" 2>/dev/null | paste -sd'|' -)"
+  [ ! -f "$BUCKLE_LOG" ] || tmux_doctor_info bucklespring.log "log tail" --detail "$(log_tail "$BUCKLE_LOG")"
   return 0
 }
 
