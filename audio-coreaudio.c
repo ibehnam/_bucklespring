@@ -9,26 +9,23 @@
  *
  * The DefaultOutput AudioUnit is Apple's own answer to that question: it tracks the system
  * default output device inside CoreAudio, across AirPods pairing, Control Centre switches,
- * hot-plug and AirPlay, while the render callback keeps running. So there is nothing to
- * listen for and nothing to reopen. A stall watchdog (audio_monitor, a main-run-loop timer)
- * stays as belt and braces: if the render callback stops advancing, or the unit is provably
- * not on the default device any more, the unit is rebuilt, whether or not anyone is typing.
- * The mixer is ours: a few dozen one-shot voices,
- * constant-power pan, per-voice gain. That replaces both libopenal and the unmaintained
- * ALURE loader (previously fetched from archive.org) on this platform.
+ * hot-plug and AirPlay. So there is nothing to listen for and nothing to reopen. The unit
+ * runs only while clicks play: the first click starts it and it stops 30 s after the last,
+ * because a started unit keeps a render thread busy and holds a sleep assertion around the
+ * clock. While it runs, a timer on the main run loop proves it: a render counter that stops
+ * advancing, or a unit provably not on the default device, gets the unit rebuilt. The mixer
+ * is ours: a few dozen one-shot voices, constant-power pan, per-voice gain. That replaces
+ * both libopenal and the unmaintained ALURE loader (previously fetched from archive.org) on
+ * this platform.
  */
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreAudio/CoreAudio.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "buckle.h"
@@ -36,11 +33,14 @@
 #define ENGINE_RATE      48000.0   /* client format on the unit's input scope; AUHAL converts to the device */
 #define VOICES           32        /* simultaneous one-shot clicks; each is ~100 ms */
 #define MAX_SAMPLES      512       /* main.c caches one handle per (scancode, press) */
-#define STALL_NS         1500000000ULL   /* no render callback for this long while started ⇒ stalled */
+#define STALL_NS         1500000000ULL   /* a started unit with no render callback for this long has stalled */
 #define RECOVER_GAP_NS   2000000000ULL   /* never rebuild the unit more often than this */
 #define RECOVER_MAX_NS   300000000000ULL /* rebuilds that do not heal back off, doubling, up to this */
-#define MONITOR_S        0.5             /* watchdog tick, seconds */
-#define HEARTBEAT_NS     5000000000ULL   /* rewrite the heartbeat file this often while the output renders */
+#define MONITOR_S        0.5             /* the timer's tick while the unit runs, seconds */
+#define PARKED_S         1.0e9           /* the timer's next fire while the unit is stopped: never */
+#define IDLE_NS          30000000000ULL  /* the unit stops this long after the last click */
+#define LATE_NS          150000000ULL    /* a click whose start took longer is too late to play */
+#define QUEUED_NS        50000000ULL     /* and so are the keys that queued behind that start */
 
 struct sample { float *pcm; uint32_t frames; };
 static struct sample samples[MAX_SAMPLES + 1];   /* handles are 1-based; 0 means failure */
@@ -56,15 +56,19 @@ struct voice {
 };
 static struct voice voices[VOICES];
 
-static AudioUnit g_unit;
+static AudioUnit g_unit;                    /* initialised; started only while clicks play */
+static int g_running;                       /* g_unit is started (main thread only) */
 static AudioDeviceID g_pinned;              /* -d: HALOutput bound to this id; 0 = DefaultOutput (follows) */
-static _Atomic uint64_t g_renders;          /* render callbacks so far: the heartbeat the watchdog reads */
+static AudioDeviceID g_default;             /* the default output when last asked (wanted_device) */
+static _Atomic uint64_t g_renders;          /* render callbacks so far: the counter the timer reads */
 static uint64_t g_seen_renders, g_seen_ns;  /* last time the main thread saw the counter move */
 static uint64_t g_recover_ns;               /* uptime of the last rebuild */
 static uint64_t g_recover_gap = RECOVER_GAP_NS;   /* least uptime between two rebuilds (see recover) */
 static int g_follow_misses;                 /* consecutive ticks that found the unit off the default device */
-
-static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static uint64_t g_click_ns;                 /* uptime of the latest click that wanted to play */
+static uint64_t g_late_until;               /* a click before this uptime queued behind a slow start */
+static int g_slow_named;                    /* a slow start has named its device in this life's log */
+static CFRunLoopTimerRef g_timer;           /* the tick; parked while the unit is stopped */
 
 /* ---- CoreAudio device facts ------------------------------------------------------------ */
 
@@ -187,7 +191,7 @@ static OSStatus render(void *ref, AudioUnitRenderActionFlags *flags, const Audio
 	return noErr;
 }
 
-/* ---- The output unit ------------------------------------------------------------------- */
+/* ---- The output unit: main thread ------------------------------------------------------ */
 
 static void on_unit_device(void *ref, AudioUnit unit, AudioUnitPropertyID id, AudioUnitScope scope, AudioUnitElement elem)
 {
@@ -198,17 +202,45 @@ static void on_unit_device(void *ref, AudioUnit unit, AudioUnitPropertyID id, Au
 	if (buf[0]) fprintf(stderr, "buckle: output device is now \"%s\"\n", buf);
 }
 
-static void unit_destroy(void)
+/* No render thread is running: drop every voice, so a click left over from a stall never
+ * plays at the next start, and park the timer. */
+static void output_idle(void)
 {
-	if (!g_unit) return;
-	AudioUnitRemovePropertyListenerWithUserData(g_unit, kAudioOutputUnitProperty_CurrentDevice, on_unit_device, NULL);
-	AudioOutputUnitStop(g_unit);
-	AudioUnitUninitialize(g_unit);
-	AudioComponentInstanceDispose(g_unit);
-	g_unit = NULL;
+	g_running = 0;
+	for (int v = 0; v < VOICES; v++)
+		atomic_store_explicit(&voices[v].state, V_FREE, memory_order_relaxed);
+	if (g_timer)
+		CFRunLoopTimerSetNextFireDate(g_timer, CFAbsoluteTimeGetCurrent() + PARKED_S);
 }
 
-/* Build, initialise and start the unit. DefaultOutput unless a device was pinned with -d. */
+static void unit_destroy(void)
+{
+	if (g_unit) {
+		AudioUnitRemovePropertyListenerWithUserData(g_unit, kAudioOutputUnitProperty_CurrentDevice, on_unit_device, NULL);
+		AudioOutputUnitStop(g_unit);
+		AudioUnitUninitialize(g_unit);
+		AudioComponentInstanceDispose(g_unit);
+		g_unit = NULL;
+	}
+	output_idle();
+}
+
+/* Stop the unit: no render thread, no sleep assertion, no timer. AudioOutputUnitStop returns
+ * only once the render callback is not running. A stop that fails disposes of the unit,
+ * which ends its render thread just the same; the next click builds another. */
+static void unit_stop(void)
+{
+	OSStatus st;
+
+	if (g_running && (st = AudioOutputUnitStop(g_unit)) != noErr) {
+		fprintf(stderr, "buckle: cannot stop the output unit (%d); disposing of it\n", (int)st);
+		unit_destroy();
+		return;
+	}
+	output_idle();
+}
+
+/* Build and initialise the unit, stopped. DefaultOutput unless a device was pinned with -d. */
 static int unit_create(void)
 {
 	AudioComponentDescription desc = { kAudioUnitType_Output,
@@ -227,18 +259,107 @@ static int unit_create(void)
 	if (st == noErr) st = AudioUnitSetProperty(g_unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
 	if (st == noErr) AudioUnitAddPropertyListener(g_unit, kAudioOutputUnitProperty_CurrentDevice, on_unit_device, NULL);
 	if (st == noErr) st = AudioUnitInitialize(g_unit);
-	if (st == noErr) st = AudioOutputUnitStart(g_unit);
 	if (st != noErr) {
-		fprintf(stderr, "buckle: cannot start the output unit (%d)\n", (int)st);
+		fprintf(stderr, "buckle: cannot initialise the output unit (%d)\n", (int)st);
 		unit_destroy();
 		return -1;
 	}
-	g_seen_renders = atomic_load(&g_renders);
-	g_seen_ns = now_ns();
-	g_follow_misses = 0;
 	return 0;
 }
 
+/*
+ * Rebuild the unit, stopped, at most once per g_recover_gap of uptime (NOW is the caller's
+ * reading). Every rebuild doubles the gap, up to RECOVER_MAX_NS, and the first tick that finds
+ * the unit rendering on the device it should puts it back to RECOVER_GAP_NS, so a rebuild that
+ * heals costs nothing later; a new default device ends the backoff at once (wanted_device). An
+ * output that stays dead is rebuilt 4, 8, 16 ... 300 s apart instead, which bounds its log
+ * lines the same way. A failed start, a stall, and a missed follow all share this one gap.
+ */
+static void recover(uint64_t now, const char *why)
+{
+	if (now - g_recover_ns < g_recover_gap) return;
+	g_recover_ns = now;
+	g_recover_gap = g_recover_gap < RECOVER_MAX_NS / 2 ? g_recover_gap * 2 : RECOVER_MAX_NS;
+	fprintf(stderr, "buckle: %s; rebuilding the output unit\n", why);
+	unit_destroy();
+	if (unit_create() == 0) {
+		char buf[256];
+		device_name(unit_device(g_unit), buf, sizeof buf);
+		fprintf(stderr, "buckle: output unit rebuilt on \"%s\"\n", buf);
+	}
+}
+
+/* The device the unit should render to: the pinned one, or the system default now. A default
+ * that changed since the last answer ends any rebuild backoff, so sound returns with the
+ * device rather than minutes later. */
+static AudioDeviceID wanted_device(void)
+{
+	AudioDeviceID want;
+
+	if (g_pinned) return g_pinned;
+	want = default_output();
+	if (want != g_default) {
+		g_default = want;
+		g_recover_ns = 0;
+		g_recover_gap = RECOVER_GAP_NS;
+	}
+	return want;
+}
+
+/*
+ * Start the unit for a click, rebuilding it first when it is missing or sits off the default
+ * device: a stopped unit is never trusted to have followed a device change. 0 when the click
+ * may play. A start that takes longer than LATE_NS delivers its click too late, and the keys
+ * typed during it queue behind it and arrive within QUEUED_NS, so all of them are dropped: the
+ * rule engages only after a measured slow start, so it can never silence a fast device, and it
+ * reads no clock but this daemon's. Such a device is named once per life.
+ */
+static int output_start(uint64_t now)
+{
+	AudioDeviceID want = wanted_device();
+	uint64_t took;
+	OSStatus st;
+	char why[64], buf[256];
+
+	if (g_unit && !g_pinned && want != kAudioObjectUnknown && unit_device(g_unit) != want)
+		recover(now, "the output unit is not on the default device");
+	if (!g_unit)
+		recover(now, "the output unit is missing");
+	if (!g_unit) {
+		output_stalled(STALL_AUDIO, want == kAudioObjectUnknown ? "no output device" : "no output unit");
+		return -1;
+	}
+	st = AudioOutputUnitStart(g_unit);
+	took = uptime_ns() - now;
+	if (st != noErr) {
+		snprintf(why, sizeof why, "cannot start the output unit (%d)", (int)st);
+		output_stalled(STALL_AUDIO, why);
+		unit_destroy();
+		return -1;
+	}
+	g_running = 1;
+	g_seen_renders = atomic_load(&g_renders);
+	g_seen_ns = uptime_ns();
+	g_follow_misses = 0;
+	if (g_timer)
+		CFRunLoopTimerSetNextFireDate(g_timer, CFAbsoluteTimeGetCurrent() + MONITOR_S);
+	if (took <= LATE_NS) return 0;
+	if (!g_slow_named) {
+		g_slow_named = 1;
+		device_name(unit_device(g_unit), buf, sizeof buf);
+		fprintf(stderr, "buckle: output \"%s\" started %llu ms after its key; a click that late, and the "
+			"keys queued behind it, are dropped\n", buf, (unsigned long long)(took / 1000000));
+	}
+	g_late_until = uptime_ns() + QUEUED_NS;
+	return -1;
+}
+
+/*
+ * Create and initialise the unit once, stopped: creating costs about 130 ms, paid here
+ * rather than on a key, and the first click starts it. No output device at startup is not
+ * fatal: the first click after one appears builds the unit. A pinned device that does not
+ * exist is the caller's mistake, and is.
+ */
 int audio_open(const char *device)
 {
 	char buf[256];
@@ -246,11 +367,11 @@ int audio_open(const char *device)
 	if (device) {
 		g_pinned = device_by_name(device);
 		if (g_pinned == kAudioObjectUnknown) { fprintf(stderr, "buckle: no output device named \"%s\"\n", device); return -1; }
-	} else if (default_output() == kAudioObjectUnknown) {
-		fprintf(stderr, "buckle: no default output device\n");
-		return -1;
+	} else if (wanted_device() == kAudioObjectUnknown) {
+		fprintf(stderr, "buckle: no default output device yet; the first click after one appears builds the output\n");
+		return 0;
 	}
-	if (unit_create() != 0) return -1;
+	if (unit_create() != 0) return 0;
 	device_name(unit_device(g_unit), buf, sizeof buf);
 	if (g_pinned) fprintf(stderr, "buckle: output pinned to \"%s\"\n", buf);
 	else          fprintf(stderr, "buckle: output follows the system default (now \"%s\")\n", buf);
@@ -264,7 +385,8 @@ void audio_close(void)
 
 /* ---- Samples ---------------------------------------------------------------------------- */
 
-/* Decode any file CoreAudio can read to mono Float32 at ENGINE_RATE, once, for the process life. */
+/* Decode any file CoreAudio can read to mono Float32 at ENGINE_RATE, once, for the process
+ * life, trimmed to its length. */
 int audio_load(const char *path)
 {
 	if (nsamples >= MAX_SAMPLES) return 0;
@@ -289,7 +411,7 @@ int audio_load(const char *path)
 		return 0;
 	}
 	uint32_t cap = (uint32_t)((double)src_frames * ENGINE_RATE / src.mSampleRate) + 4096, total = 0;
-	float *pcm = calloc(cap, sizeof(float));
+	float *pcm = calloc(cap, sizeof(float)), *fit;
 	if (!pcm) { ExtAudioFileDispose(file); return 0; }
 	while (total < cap) {
 		AudioBufferList bl;
@@ -308,6 +430,8 @@ int audio_load(const char *path)
 		free(pcm);
 		return 0;
 	}
+	if (total < cap && (fit = realloc(pcm, total * sizeof(float))))   /* the converter's headroom goes */
+		pcm = fit;
 	samples[++nsamples].pcm = pcm;
 	samples[nsamples].frames = total;
 	return nsamples;
@@ -316,183 +440,97 @@ int audio_load(const char *path)
 /*
  * A new sound pack: drop every decoded sample, so main.c reloads them lazily from the new
  * directory. The render thread reads sample PCM through PLAYING voices, so the unit stops
- * first: AudioOutputUnitStop returns only once the render callback is not running, and
- * nothing reads a voice until the unit starts again. Without a unit there is no render
- * thread. A stop that fails leaves the old PCM allocated rather than freed under a reader.
+ * first, which clears them; the next click starts it again.
  */
 void audio_forget_samples(void)
 {
-	OSStatus st = g_unit ? AudioOutputUnitStop(g_unit) : noErr;
-
-	if (st == noErr) {
-		for (int v = 0; v < VOICES; v++)
-			atomic_store_explicit(&voices[v].state, V_FREE, memory_order_relaxed);
-		for (int i = 1; i <= nsamples; i++) {
-			free(samples[i].pcm);
-			samples[i].pcm = NULL;
-			samples[i].frames = 0;
-		}
-	} else {
-		fprintf(stderr, "buckle: cannot stop the output unit (%d); keeping the old samples in memory\n", (int)st);
+	unit_stop();
+	for (int i = 1; i <= nsamples; i++) {
+		free(samples[i].pcm);
+		samples[i].pcm = NULL;
+		samples[i].frames = 0;
 	}
 	nsamples = 0;
-	if (g_unit && (st = AudioOutputUnitStart(g_unit)) != noErr)
-		fprintf(stderr, "buckle: cannot restart the output unit (%d)\n", (int)st);
 }
 
-/* ---- Watchdog and heartbeat: a main-run-loop timer, whether or not anyone types ---------- */
+/* ---- The timer: a main-run-loop tick, only while the unit runs -------------------------- */
 
-/*
- * Rebuild the unit, at most once per g_recover_gap of uptime (NOW is the watchdog's reading).
- * Every rebuild doubles the gap, up to RECOVER_MAX_NS, and the watchdog puts it back to
- * RECOVER_GAP_NS on the first tick that finds the output healthy again, so a rebuild that
- * heals costs nothing later. An output that stays dead, or stays off the default device, is
- * rebuilt 4, 8, 16 ... 300 s apart instead, which bounds its two log lines per rebuild the
- * same way. The missing-unit, stall and follow triggers all share this one gap.
- */
-static void recover(uint64_t now, const char *why)
+static void monitor_tick(CFRunLoopTimerRef timer, void *info)
 {
-	if (now - g_recover_ns < g_recover_gap) return;
-	g_recover_ns = now;
-	g_recover_gap = g_recover_gap < RECOVER_MAX_NS / 2 ? g_recover_gap * 2 : RECOVER_MAX_NS;
-	fprintf(stderr, "buckle: %s; rebuilding the output unit\n", why);
-	unit_destroy();
-	if (unit_create() == 0) {
-		char buf[256];
-		device_name(unit_device(g_unit), buf, sizeof buf);
-		fprintf(stderr, "buckle: output unit rebuilt on \"%s\"\n", buf);
-	}
-}
-
-static void watchdog(uint64_t now, uint64_t renders)
-{
+	(void)timer; (void)info;
+	uint64_t now = uptime_ns(), renders = atomic_load_explicit(&g_renders, memory_order_relaxed);
 	int advanced = renders != g_seen_renders, on_default = 1;
 
-	if (!g_unit) { recover(now, "output unit missing"); return; }
+	pulse();   /* the key thread runs this timer: it is alive */
+	if (!g_running) return;
+	if (now - g_click_ns >= IDLE_NS) { unit_stop(); return; }
 
 	/* A started unit renders every few milliseconds, so a counter that has not moved for
 	 * STALL_NS is a dead IO thread, whatever the unit claims. NOW is uptime, which stops
 	 * while the machine sleeps, so a wake is not a stall. A device switch pauses rendering
 	 * for ~100 ms; the threshold clears that. */
-	if (advanced) { g_seen_renders = renders; g_seen_ns = now; }
-	else if (now - g_seen_ns > STALL_NS) { g_seen_ns = now; recover(now, "output stalled (no render callback)"); return; }
+	if (advanced) {
+		g_seen_renders = renders;
+		g_seen_ns = now;
+		output_recovered(STALL_AUDIO);
+	} else if (now - g_seen_ns > STALL_NS) {
+		g_seen_ns = now;
+		output_stalled(STALL_AUDIO, "no render callback for 1.5 s");
+		recover(now, "the output stalled");
+		return;
+	}
 
 	/* Follow check: the DefaultOutput unit moves itself, but prove it. Two consecutive ticks
 	 * that find it off the default device mean the internal switch did not land; a fresh
-	 * unit binds to the current default, so a move heals within a second, keys or none. */
+	 * unit binds to the current default at the next click. */
 	if (!g_pinned) {
-		AudioDeviceID want = default_output(), have = unit_device(g_unit);
+		AudioDeviceID want = wanted_device(), have = unit_device(g_unit);
 		on_default = want == kAudioObjectUnknown || have == want;
 		if (on_default) {
 			g_follow_misses = 0;
 		} else if (++g_follow_misses >= 2) {
 			g_follow_misses = 0;
-			recover(now, "output unit is not on the default device");
+			recover(now, "the output unit is not on the default device");
 			return;
 		}
 	}
 
 	/* The first tick that sees the counter advance, on the device the unit should be on,
 	 * ends any backoff. The device counts as well as the counter: a unit rendering to the
-	 * wrong device would otherwise reset the backoff on every tick, and the follow check
-	 * would rebuild it every two seconds for as long as the mismatch lasted. */
+	 * wrong device would otherwise reset the backoff on every tick. */
 	if (advanced && on_default)
 		g_recover_gap = RECOVER_GAP_NS;
 }
 
 /*
- * The heartbeat file tells anyone who can read a file that the output is alive:
- * "<renders> <epoch>\n", replaced by rename so a reader never sees half a line. It is
- * rewritten every HEARTBEAT_NS while the render counter advances, and at once when the
- * counter moves again after a tick without renders. A stalled output leaves it alone, so
- * its mtime ages, and the status cell reads a heartbeat older than 15 s as a stalled
- * output. The cadence clock keeps running through sleep, so the first tick that renders
- * after a wake rewrites the file at once.
- */
-static char g_hb_path[PATH_MAX], g_hb_tmp[PATH_MAX];   /* empty path: no heartbeat file */
-static uint64_t g_hb_renders;      /* the counter at the previous tick */
-static uint64_t g_hb_written_ns;   /* CLOCK_MONOTONIC_RAW at the last successful write */
-static int g_hb_paused;            /* the previous tick saw no render */
-static int g_hb_failed;            /* the write-failure line has been printed */
-
-static void heartbeat_write(uint64_t renders)
-{
-	char line[48];
-	int n = snprintf(line, sizeof line, "%llu %lld\n", (unsigned long long)renders, (long long)time(NULL));
-	int err = 0, fd = open(g_hb_tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-
-	if (fd < 0) {
-		err = errno;
-	} else {
-		ssize_t w = write(fd, line, (size_t)n);
-		if (w != n) err = w < 0 ? errno : EIO;
-		if (close(fd) != 0 && !err) err = errno;
-		if (!err && rename(g_hb_tmp, g_hb_path) != 0) err = errno;
-		if (err) unlink(g_hb_tmp);
-	}
-	if (err) {
-		if (!g_hb_failed) fprintf(stderr, "buckle: cannot write the heartbeat \"%s\": %s\n", g_hb_path, strerror(err));
-		g_hb_failed = 1;
-		return;
-	}
-	g_hb_written_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-}
-
-static void heartbeat(uint64_t renders)
-{
-	if (!g_hb_path[0]) return;
-	if (renders == g_hb_renders) { g_hb_paused = 1; return; }   /* stalled: let the file age */
-	g_hb_renders = renders;
-	if (g_hb_paused || clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_hb_written_ns >= HEARTBEAT_NS) {
-		g_hb_paused = 0;
-		heartbeat_write(renders);
-	}
-}
-
-static void monitor_tick(CFRunLoopTimerRef timer, void *info)
-{
-	(void)timer; (void)info;
-	uint64_t renders = atomic_load_explicit(&g_renders, memory_order_relaxed);
-	watchdog(now_ns(), renders);
-	heartbeat(renders);
-}
-
-/*
- * Start the watchdog: a MONITOR_S timer on the MAIN run loop in the common modes, which is
- * the loop scan() runs with CFRunLoopRun on the main thread, so it fires between key events
- * whether or not any arrive. Called once, after audio_open succeeds. HEARTBEAT_PATH names
- * the heartbeat file, written once now and then as above; NULL means none.
+ * Create the timer on the MAIN run loop in the common modes, which is the loop scan() runs
+ * with CFRunLoopRun on the main thread, parked until the first start. Called once, after
+ * audio_open. The argument is retired with the render.hb heartbeat; the interface keeps it
+ * for the backends this host cannot build.
  */
 void audio_monitor(const char *heartbeat_path)
 {
-	CFRunLoopTimerRef timer;
-
-	if (heartbeat_path) {
-		int a = snprintf(g_hb_path, sizeof g_hb_path, "%s", heartbeat_path);
-		int b = snprintf(g_hb_tmp, sizeof g_hb_tmp, "%s.tmp.%ld", heartbeat_path, (long)getpid());
-		if (a < 0 || b < 0 || (size_t)a >= sizeof g_hb_path || (size_t)b >= sizeof g_hb_tmp) {
-			fprintf(stderr, "buckle: heartbeat path too long; writing no heartbeat\n");
-			g_hb_path[0] = '\0';
-		} else {
-			g_hb_renders = atomic_load(&g_renders);
-			heartbeat_write(g_hb_renders);
-		}
-	}
-	timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + MONITOR_S, MONITOR_S,
-				     0, 0, monitor_tick, NULL);
-	if (!timer) {
-		fprintf(stderr, "buckle: cannot create the output watchdog timer\n");
+	(void)heartbeat_path;
+	g_timer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + PARKED_S, MONITOR_S,
+				       0, 0, monitor_tick, NULL);
+	if (!g_timer) {
+		fprintf(stderr, "buckle: cannot create the output timer; a started output never stops\n");
 		return;
 	}
-	CFRunLoopTimerSetTolerance(timer, MONITOR_S / 5);   /* let the system coalesce wakeups */
-	CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
-	CFRelease(timer);                                    /* the run loop holds it now */
+	CFRunLoopTimerSetTolerance(g_timer, MONITOR_S / 5);   /* let the system coalesce wakeups */
+	CFRunLoopAddTimer(CFRunLoopGetMain(), g_timer, kCFRunLoopCommonModes);
 }
 
 int audio_play(int sample, double pan, int gain_pct)
 {
+	uint64_t now;
+
 	if (sample <= 0 || sample > nsamples) return -1;
-	if (!g_unit || gain_pct <= 0) return 0;
+	if (gain_pct <= 0) return 0;
+	now = uptime_ns();
+	g_click_ns = now;
+	if (now < g_late_until) return 0;   /* typed during a slow start: too late to play */
+	if (!g_running && output_start(now) != 0) return -1;
 
 	/* Constant-power pan: pan -1 = left, +1 = right, 0 = centre at -3 dB per side. */
 	if (pan < -1) pan = -1;
@@ -515,21 +553,36 @@ int audio_play(int sample, double pan, int gain_pct)
 	return 0;
 }
 
-/* --audio-check: open silently, prove the render thread runs and the unit sits on the device
- * it should (the system default, or the pinned one). Prints one line; 0 healthy, 1 not,
- * 2 no output device at all. The shell suite drives this. */
+/* --audio-check: open silently, start the unit as a click would, prove the render thread runs
+ * on the device it should (the system default, or the pinned one), then stop it as the idle
+ * timer would and prove the rendering stopped. Prints one line; 0 healthy, 1 not, 2 no output
+ * device at all. The shell suite drives this. */
 int audio_check(const char *device)
 {
 	char have[256], want[256];
+	uint64_t t, started, stopped, renders, after;
+
 	if (!device && default_output() == kAudioObjectUnknown) { printf("no output device\n"); return 2; }
 	if (audio_open(device) != 0) return 1;
-	uint64_t before = atomic_load(&g_renders);
+	t = uptime_ns();
+	output_start(t);   /* a slow start still starts: the verdict below judges the unit */
+	started = uptime_ns() - t;
+	if (!g_running) { printf("the output unit did not start FAIL\n"); audio_close(); return 1; }
+	renders = atomic_load(&g_renders);
 	usleep(400000);
-	uint64_t renders = atomic_load(&g_renders) - before;
+	renders = atomic_load(&g_renders) - renders;
 	device_name(unit_device(g_unit), have, sizeof have);
 	device_name(device ? g_pinned : default_output(), want, sizeof want);
-	int ok = renders > 0 && strcmp(have, want) == 0;
-	printf("device=\"%s\" expected=\"%s\" renders=%llu %s\n", have, want, (unsigned long long)renders, ok ? "ok" : "FAIL");
+	t = uptime_ns();
+	unit_stop();
+	stopped = uptime_ns() - t;
+	after = atomic_load(&g_renders);
+	usleep(100000);
+	after = atomic_load(&g_renders) - after;
+	int ok = renders > 0 && after == 0 && !g_running && strcmp(have, want) == 0;
+	printf("device=\"%s\" expected=\"%s\" renders=%llu start=%llums stop=%llums renders-after-stop=%llu %s\n",
+	       have, want, (unsigned long long)renders, (unsigned long long)(started / 1000000),
+	       (unsigned long long)(stopped / 1000000), (unsigned long long)after, ok ? "ok" : "FAIL");
 	audio_close();
 	return ok ? 0 : 1;
 }

@@ -574,14 +574,71 @@ static void settings_reload(void)
 	}
 }
 
+/* Uptime in nanoseconds, from a clock that stops while the machine sleeps, so a sleep is
+ * never read as a stall. */
+uint64_t uptime_ns(void)
+{
+	struct timespec ts;
+
+#ifdef CLOCK_UPTIME_RAW
+	clock_gettime(CLOCK_UPTIME_RAW, &ts);
+#else
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/*
+ * A stalled output is two log lines, `output stalled: WHY` and `output recovered`, the same
+ * mechanism as the keyboard tap's: the status cell paints a live daemon yellow while the
+ * latest of them is the stall. The audio timer on the key thread and the identity watch can
+ * each declare one, so they share a lock and one set of causes: each new cause writes a
+ * stall line, and the recovery is written once no cause is left.
+ */
+static pthread_mutex_t stall_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned stall_causes;
+
+void output_stalled(unsigned cause, const char *why)
+{
+	pthread_mutex_lock(&stall_lock);
+	if (!(stall_causes & cause)) {
+		stall_causes |= cause;
+		say("buckle: output stalled: %s\n", why);
+	}
+	pthread_mutex_unlock(&stall_lock);
+}
+
+void output_recovered(unsigned cause)
+{
+	pthread_mutex_lock(&stall_lock);
+	if (stall_causes & cause) {
+		stall_causes &= ~cause;
+		if (!stall_causes)
+			say("buckle: output recovered\n");
+	}
+	pthread_mutex_unlock(&stall_lock);
+}
+
+/* The key thread's pulse: the uptime of the latest, 0 before the first. Its run loop's timers
+ * pulse at least every five seconds (the tap watchdog), so a key thread that has not pulsed
+ * for PULSE_LOST_NS is hung, in an audio or file call, and cannot click. */
+#define PULSE_LOST_NS 15000000000ULL
+static _Atomic uint64_t pulse_ns;
+
+void pulse(void)
+{
+	atomic_store_explicit(&pulse_ns, uptime_ns(), memory_order_relaxed);
+}
+
 /*
  * The identity watch. A daemon whose pidfile is gone is an orphan that no Stop can reach:
  * two test daemons whose sandbox was removed kept clicking until a reboot. So once the life
  * has started, a thread looks at the claim every second. Only a path that is gone (ENOENT)
  * or names another inode counts as losing it, any other error is unknown and changes
  * nothing, and two losses in a row end the life with a line saying why
- * (docs/lessons/daemons/identity.md). The thread runs with TERM, INT, and HUP blocked, so
- * they stay on the main thread, whose handlers and waits expect them.
+ * (docs/lessons/daemons/identity.md). The same thread supervises the key thread through its
+ * pulse, so a hung daemon still turns its icon yellow. It runs with TERM, INT, and HUP
+ * blocked, so they stay on the main thread, whose handlers and waits expect them.
  */
 #define WATCH_S      1   /* the identity watch's period, seconds */
 #define CLAIM_LOSSES 2   /* consecutive losses of the claim that end the life */
@@ -589,6 +646,7 @@ static void settings_reload(void)
 static void *identity_watch(void *arg)
 {
 	int losses = 0, mine;
+	uint64_t last;
 
 	(void)arg;
 	for (;;) {
@@ -600,6 +658,13 @@ static void *identity_watch(void *arg)
 			say("buckle: %s no longer names this daemon; exiting\n", claimed_path);
 			_exit(EXIT_FAILURE);
 		}
+		last = atomic_load_explicit(&pulse_ns, memory_order_relaxed);
+		if (!last)
+			continue;   /* a scanner that never pulses is never supervised */
+		if (uptime_ns() - last > PULSE_LOST_NS)
+			output_stalled(STALL_KEYS, "the key thread has not run for 15 s");
+		else
+			output_recovered(STALL_KEYS);
 	}
 	return NULL;
 }
@@ -648,17 +713,17 @@ static void hold_claim(void)
 	}
 }
 
-/* <dirname of the pidfile>/render.hb, the audio heartbeat beside the identity it belongs to. */
-static const char *heartbeat_path(char *buf, size_t size)
+/* TRANSITIONAL (delete once no host runs a daemon built before 2026-11-12): the retired
+ * audio heartbeat, render.hb beside the pidfile, which an older daemon left behind. */
+static void remove_old_heartbeat(void)
 {
-	const char *slash;
-	int dir, n;
+	const char *slash = strrchr(opt_pidfile, '/');
+	char buf[PATH_MAX];
+	int n;
 
-	if (!opt_pidfile) return NULL;
-	slash = strrchr(opt_pidfile, '/');
-	dir = slash ? (int)(slash - opt_pidfile) + 1 : 0;
-	n = snprintf(buf, size, "%.*srender.hb", dir, opt_pidfile);
-	return n >= 0 && (size_t)n < size ? buf : NULL;
+	n = snprintf(buf, sizeof buf, "%.*srender.hb", slash ? (int)(slash - opt_pidfile) + 1 : 0, opt_pidfile);
+	if (n > 0 && (size_t)n < sizeof buf)
+		unlink(buf);
 }
 
 
@@ -667,7 +732,6 @@ int main(int argc, char **argv)
 	int c;
 	int rv;
 	int idx;
-	char hb[PATH_MAX];
 
 	/* Lines held by the parse still reach stderr on every exit before the start. */
 	atexit(release_held);
@@ -733,7 +797,7 @@ int main(int argc, char **argv)
 				return 0;
 			case OPT_AUDIO_CHECK:
 				/* Open the output (pinned with -d if that came first), prove it
-				 * renders on the device it should, print the verdict, and exit. */
+				 * renders on the device it should and stops, print the verdict, and exit. */
 				release_held();
 				return audio_check(opt_device);
 			case OPT_LOG:
@@ -789,6 +853,8 @@ int main(int argc, char **argv)
 		opt_claim_only = 1;
 	}
 	release_held();
+	if (opt_pidfile)
+		remove_old_heartbeat();
 	identity_watch_start();
 	if (opt_claim_only)
 		hold_claim();
@@ -802,8 +868,9 @@ int main(int argc, char **argv)
 	}
 
 	/* Open the output. Without -d the backend follows the system default output
-	 * for the life of the process; with -d it stays on the named device. Either
-	 * failure below is the daemon's own: the pidfile goes, the icon turns red, and the
+	 * for the life of the process; with -d it stays on the named device. A failure
+	 * here (a pinned device that does not exist, or an OpenAL device that will not
+	 * open) is the daemon's own: the pidfile goes, the icon turns red, and the
 	 * plugin's reconciler starts a new life at the next attach. */
 
 	if (audio_open(opt_device) != 0) {
@@ -811,7 +878,7 @@ int main(int argc, char **argv)
 		rv = EXIT_FAILURE;
 		goto out;
 	}
-	audio_monitor(heartbeat_path(hb, sizeof hb));
+	audio_monitor(NULL);
 
 	printd("Using wav dir: \"%s\"\n", opt_path_audio);
 
@@ -852,13 +919,15 @@ static void usage(char *exe)
 		"                            --quiet-from (the default) disables the window\n"
 		"      --quiet-gain=GAIN     gain [0..100] used inside the window (default 0)\n"
 		"      --gain-at=MIN         print the gain a click at MIN would play at, and exit\n"
-		"      --audio-check         open the output, verify it renders on the expected\n"
-		"                            device, print the verdict, and exit\n"
+		"      --audio-check         start the output as a click would, verify it renders\n"
+		"                            on the expected device and stops, print the verdict,\n"
+		"                            and exit\n"
 		"      --log=PATH            write stderr to PATH (after the --pidfile claim, if any),\n"
 		"                            keeping the previous file as PATH.1\n"
 		"      --pidfile=PATH        claim PATH (an exclusive lock holding this pid) before\n"
-		"                            starting; exit 75 while another process holds it. The\n"
-		"                            audio heartbeat, render.hb, is written beside it\n"
+		"                            starting; exit 75 while another process holds it, and\n"
+		"                            exit once PATH no longer names this one. Outside the\n"
+		"                            account's home, hold it with no audio and no keys\n"
 		"      --settings=PATH       read KEY=VALUE lines: gain, quiet_from, quiet_to,\n"
 		"                            quiet_gain, and profile (default, or a directory under\n"
 		"                            ./wav-klack); SIGHUP rereads PATH at the next key\n"

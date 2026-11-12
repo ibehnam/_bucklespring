@@ -205,6 +205,7 @@ static void tap_watchdog(CFRunLoopTimerRef timer, void *info)
 {
 	(void)timer;
 	(void)info;
+	pulse();   /* the key thread runs this timer: it is alive (main.c supervises the pulse) */
 	if (!g_tap) {   /* never created: the grant may have landed since */
 		if (tap_create() == 0)
 			fprintf(stderr, "buckle: event tap created; waiting for the first key\n");
