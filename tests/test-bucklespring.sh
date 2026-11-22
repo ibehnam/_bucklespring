@@ -61,7 +61,7 @@ trap cleanup EXIT
 . "$TMUX_CONFIG_DIR/AI/tmux-ui-lib.sh"   # tmux_quiet_* / tmux_volume_* — the shell half of the parity case
 
 # Capturing tmux shim: capture `display-menu` argv (one per line) to MENU_ARGS,
-# record `display-popup` argv (the build popup — an UNATTENDED path must never open one),
+# record `display-popup` argv, a word a line (the build popup — an UNATTENDED path must never open one),
 # suppress deferred run-shell children, and pass everything else through to the isolated
 # -L server.
 MENU_ARGS="$TS_TMP/menu.args"; : > "$MENU_ARGS"
@@ -75,7 +75,7 @@ if [ "\${1:-}" = display-menu ]; then
   exit 0
 fi
 if [ "\${1:-}" = display-popup ]; then
-  printf '%s\n' "\$*" >> "$POPUP_LOG"
+  for a in "\$@"; do printf '%s\n' "\$a" >> "$POPUP_LOG"; done
   exit 0
 fi
 if [ "\${1:-}" = run-shell ]; then
@@ -782,6 +782,20 @@ test_unattended_build_is_quiet() {
   clear_running
 }
 
+# An interactive start that finds the binary stale builds it in a popup: this script again, as
+# separate words after --, so tmux execs it and no default shell starts first.
+test_interactive_build_popup_is_words() {
+  rm -f "$BUCKLE_LAUNCH_LOG"
+  : > "$POPUP_LOG"
+  touch -t 202101010000 "$FAKE_BUCKLE_DIR/source.c"
+  BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" start default 2>/dev/null
+  assert_eq "interactive build: the popup execs this script as words after --" \
+    "$(cd "$HERE/.." && pwd)/plugin.sh"$'\n'build-popup$'\n'"$FAKE_BUCKLE_DIR" \
+    "$(sed -n '/^--$/,$p' "$POPUP_LOG" | sed 1d)"
+  assert_eq "interactive build: and launches nothing while the binary stays stale" 0 "$(launch_count)"
+  touch -t 201901010000 "$FAKE_BUCKLE_DIR/source.c"
+}
+
 test_failed_build_popup_holds_and_preserves_rc() {
   local fail_dir="$TS_TMP/failing build" output rc
   mkdir -p "$fail_dir"
@@ -820,6 +834,7 @@ test_restore_is_idempotent_when_running
 test_forced_restore_restarts_only_new_code
 test_restore_relaunches_a_previous_servers_holder
 test_unattended_build_is_quiet
+test_interactive_build_popup_is_words
 test_failed_build_popup_holds_and_preserves_rc
 
 # --- Isolation: this suite never touches the machine's live daemon ------------

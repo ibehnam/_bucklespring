@@ -251,10 +251,9 @@ ensure_binary() { # [quiet]
     mkdir -p "$BUCKLE_CACHE_DIR"
     _build "$BUCKLE_DIR" >>"$BUCKLE_CACHE_DIR/build.log" 2>&1 || true
   else
-    # Re-enter this script with one argv so the popup's fish shell never owns
-    # build control flow or status handling.
-    tmux_popup -E -xC -yC -w 80% -h 60% \
-      "'$SELF' build-popup '$BUCKLE_DIR'"
+    # Re-enter this script as separate words after --: tmux execs it, so no
+    # default shell starts first or owns the build's control flow and status.
+    tmux_popup -E -xC -yC -w 80% -h 60% -- "$SELF" build-popup "$BUCKLE_DIR"
   fi
   binary_current && return 0
   printf 'bucklespring: %s/buckle is missing or older than its sources; not launching it\n' "$BUCKLE_DIR" >&2
