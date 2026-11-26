@@ -432,20 +432,29 @@ show_menu() {
 
   # Profile picker and action validator consume this same enumeration.
   local -a items=()
-  local value label
+  local value label name="" gain_key
   while IFS=$'\t' read -r value label; do
     items+=( "$value"$'\t'"$label" )
+    [ "$value" = "$current" ] && name=${label%%"$TMUX_MENU_FS"*}
   done < <(buckle_profile_rows)
-  tmux_menu_radio_rows rows "$current" "$SELF start" 0 "${items[@]}"
+  # More profiles than a menu draws inline take their own submenu, whose row names the
+  # choice (CLAUDE/menus/rows.md, "Choice rows"); the volume's keys then start at 1.
+  if [ "${#items[@]}" -gt "$TMUX_MENU_INLINE_MAX" ]; then
+    rows+=("submenu"$'\t'"Profile · ${name:-$current}"$'\t'f$'\t'"run-shell -b '$SELF profile-menu {MENU_BACK}'")
+    gain_key=1
+  else
+    tmux_menu_radio_rows rows "$current" "$SELF start" 0 "${items[@]}"
+    gain_key=${#items[@]}
+  fi
 
   # Divider between the sound-picker section and the volume section, then the volume group
-  # (keys continue after the profiles: next free key = item count). Bold the EFFECTIVE
+  # (keys continue after inline profiles: next free key = item count). Bold the EFFECTIVE
   # level (quiet window applied), not the raw @buckle_gain, so the mark matches what buckle
   # actually plays right now — symmetric with notif.
   rows+=("separator")
   tmux_menu_volume_rows rows \
     "$(tmux_volume_effective "$(current_gain)" "$(quiet_from)" "$(quiet_to)")" \
-    "$SELF gain" "${#items[@]}"
+    "$SELF gain" "$gain_key"
 
   # Separator + the quiet window that caps those levels — same shared row as notif's, and
   # ABOVE the conditional permission row below so every sticky index baked in at build time
@@ -454,8 +463,8 @@ show_menu() {
   tmux_menu_quiet_row rows "$(quiet_from)" "$(quiet_to)" h \
     "$SELF quiet-commit${back_b64:+ $back_b64}"
 
-  # (existing) separator + Running toggle — serves as the volume|toggle divider. The ✓+bold
-  # checkbox marks the daemon as running, matching every other stateful toggle.
+  # (existing) separator + Running toggle — serves as the volume|toggle divider. The checked,
+  # bold checkbox marks the daemon as running, matching every other stateful toggle.
   rows+=("separator")
   local running; is_running && running=on || running=off
   rows+=("toggle"$'\t'"$(tmux_menu_label on Running "$running")"$'\t's$'\t'"$SELF toggle")
@@ -468,6 +477,19 @@ show_menu() {
   fi
 
   tmux_menu_show BUCKLESPRING "$(tmux_menu_decode "$back_b64")" "${rows[@]}"
+}
+
+# PROFILE: the profiles, a group longer than BUCKLESPRING draws inline, as this menu's one
+# radio on keys 1 up; a press reopens it on the choice, and Back reaches BUCKLESPRING.
+show_profile_menu() { # back
+  local back_b64="${1:-}" value label
+  read_prefs || true
+  local -a rows=("self"$'\t'"$SELF profile-menu${back_b64:+ $back_b64}") items=()
+  while IFS=$'\t' read -r value label; do
+    items+=( "$value"$'\t'"$label" )
+  done < <(buckle_profile_rows)
+  tmux_menu_radio_rows rows "$(current_profile)" "$SELF start" 1 "${items[@]}"
+  tmux_menu_show PROFILE "$(tmux_menu_decode "$back_b64")" "${rows[@]}"
 }
 
 do_doctor() {
@@ -529,6 +551,7 @@ case "${1:-}" in
   doctor)        do_doctor ;;
   attach)        reconcile_intent ;;  # attach restarts a dead daemon
   menu)          if [ "${2:-}" = - ]; then show_menu "${3:-}"; else show_menu "${2:-}"; fi ;;
+  profile-menu)  show_profile_menu "${2:-}" ;;
   start)         do_start "${2:-default}" ;;
   stop)          do_stop ;;
   toggle)        do_toggle ;;

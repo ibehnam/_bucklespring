@@ -254,15 +254,33 @@ test_menu_sticky() {
   local dump; dump="$(cat "$MENU_ARGS")"
 
   assert_contains "buckle: title present"                              "$dump" "BUCKLESPRING"
+  # The profiles are the built-in default and one per wav-klack pack. More than a menu draws
+  # inline (TMUX_MENU_INLINE_MAX) take their own submenu, whose row names the choice; fewer
+  # stay inline. Either way their radio is the one engine's.
+  local packs profiles_dump profiles_reopen="$reopen"
+  packs=$(find "$bdir/wav-klack" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$((packs + 1))" -gt "$TMUX_MENU_INLINE_MAX" ]; then
+    assert_contains "buckle: the profiles fold into a submenu named for the choice" \
+      "$dump" $'Profile · IBM Model-M\nf\n'
+    assert_contains "buckle: the profile row opens PROFILE" "$dump" "profile-menu"
+    assert_not_contains "buckle: no profile row stays inline" "$dump" 'start "default"'
+    assert_contains "buckle: the volume's keys start at 1" "$dump" $'\n1\n'
+    TMUX_MENU_RETAIN_PARENT=1 TMUX_MENU_INTERACTIVE=1 bash "$BUCKLE" profile-menu </dev/null
+    profiles_dump="$(cat "$MENU_ARGS")"
+    profiles_reopen="$bdir/plugin.sh profile-menu"
+    assert_contains "buckle: PROFILE title present" "$profiles_dump" "PROFILE"
+  else
+    profiles_dump=$dump
+  fi
   assert_contains "buckle: default profile uses constructor-owned tag join" \
-    "$dump" "IBM Model-M  (default)"
+    "$profiles_dump" "IBM Model-M  (default)"
   # Profile radio (the built-in default is always present), volume radio (100 is always a
   # level), and the Running toggle each chain the interactive update marker, selection, and reopen
   # via tmux_menu_action so the reopened menu keeps its highlight. Only the default profile's
   # index (0) is pinned: the volume/toggle indices shift with the number of wav-klack packs
   # the submodule ships, so those assert the prefix without the number (index math is locked
   # exactly by the notif/awake/name-color/dashboard tests).
-  assert_contains "buckle: profile row chains reopen + selection"      "$dump" "start \"default\" ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT=0 $reopen"
+  assert_contains "buckle: profile row chains reopen + selection"      "$profiles_dump" "start \"default\" ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT=0 $profiles_reopen"
   assert_contains "buckle: volume row (100%) chains reopen (sticky)"  "$dump" "gain \"100\" ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT="
   assert_contains "buckle: Running row chains reopen (sticky)"        "$dump" "toggle ; TMUX_MENU_UPDATE=1 TMUX_MENU_SELECT="
   assert_contains "buckle: daemon toggle is the Running checkbox"     "$dump" "Running"

@@ -9,6 +9,11 @@ and compiler-only `menu-authority` command. The compiler executes this owner and
 profiles and absolute pidfile path for native menus. Validation runs again when an action
 executes, so a removed profile can never become the daemon's setting. See [the lessons](lessons/lifecycle.md).
 
+More profiles than a menu draws inline (`TMUX_MENU_INLINE_MAX`, five) take their own menu,
+PROFILE, a radio on keys 1 up whose press reopens it on the choice. BUCKLESPRING's `Profile ·
+<name>` row (f) names the choice and opens it, and the gain's radio then takes keys 1 to 3. Both
+the native menu and the shell twin fold the same way.
+
 ## Identity
 
 The daemon claims, logs, and guards its own identity; see [identity](identity.md).
