@@ -61,7 +61,8 @@ trap cleanup EXIT
 . "$TMUX_CONFIG_DIR/AI/tmux-ui-lib.sh"   # tmux_quiet_* / tmux_volume_* — the shell half of the parity case
 
 # Capturing tmux shim: capture `display-menu` argv (one per line) to MENU_ARGS,
-# record `display-popup` argv, a word a line (the build popup — an UNATTENDED path must never open one),
+# record `display-popup` argv, a word a line, and the launch of a registered popup that
+# `tmuxd popup open` runs (the build popup — an UNATTENDED path must never open one),
 # suppress deferred run-shell children, and pass everything else through to the isolated
 # -L server.
 MENU_ARGS="$TS_TMP/menu.args"; : > "$MENU_ARGS"
@@ -82,6 +83,7 @@ if [ "\${1:-}" = run-shell ]; then
   printf '%s\n' "\$*" >> "$RUN_SHELL_LOG"
   exit 0
 fi
+case " \$* " in *" popup run "*) printf '%s\n' "\$*" >> "$POPUP_LOG" ;; esac
 exec "$REAL_TMUX" -L "$TS_SOCK" "\$@"
 SHIM
 chmod +x "$TS_SHIMDIR/tmux"
@@ -800,16 +802,17 @@ test_unattended_build_is_quiet() {
   clear_running
 }
 
-# An interactive start that finds the binary stale builds it in a popup: this script again, as
-# separate words after --, so tmux execs it and no default shell starts first.
+# An interactive start that finds the binary stale builds it in my registered popup,
+# bucklespring.build: tmuxd composes its launch, whose popup is tmuxd's program `build`, and no
+# script of mine runs in it.
 test_interactive_build_popup_is_words() {
   rm -f "$BUCKLE_LAUNCH_LOG"
   : > "$POPUP_LOG"
   touch -t 202101010000 "$FAKE_BUCKLE_DIR/source.c"
   BUCKLE_DIR="$FAKE_BUCKLE_DIR" bash "$BUCKLE" start default 2>/dev/null
-  assert_eq "interactive build: the popup execs this script as words after --" \
-    "$(cd "$HERE/.." && pwd)/plugin.sh"$'\n'build-popup$'\n'"$FAKE_BUCKLE_DIR" \
-    "$(sed -n '/^--$/,$p' "$POPUP_LOG" | sed 1d)"
+  assert_contains "interactive build: the start opens the registered popup, tmuxd's program build" \
+    "$(cat "$POPUP_LOG")" " popup run bucklespring.build -- build"
+  assert_not_contains "interactive build: and no script of mine runs in it" "$(cat "$POPUP_LOG")" "build-popup"
   assert_eq "interactive build: and launches nothing while the binary stays stale" 0 "$(launch_count)"
   touch -t 201901010000 "$FAKE_BUCKLE_DIR/source.c"
 }
